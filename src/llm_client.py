@@ -70,7 +70,14 @@ class ChatResult:
 
 
 class SQLGenerationResponse(BaseModel):
-    """Validated shape of the JSON-mode SQL-generation response."""
+    """Validated shape of the JSON-mode SQL-generation response.
+
+    Intentionally does not enforce that ``sql`` starts with SELECT: the
+    trust boundary lives in :class:`src.validator.SQLValidator` (sqlglot AST).
+    Forwarding DDL/DML here lets the validator reject with a specific error
+    so the pipeline emits ``status="invalid_sql"`` instead of swallowing the
+    SQL into ``unanswerable``.
+    """
 
     model_config = ConfigDict(extra="ignore")
 
@@ -80,14 +87,11 @@ class SQLGenerationResponse(BaseModel):
 
     @field_validator("sql")
     @classmethod
-    def sql_must_start_with_select(cls, v: str | None) -> str | None:
-        """Policy check: SQL must start with ``SELECT`` (case-insensitive)."""
+    def strip_sql(cls, v: str | None) -> str | None:
+        """Strip surrounding whitespace; leave statement-kind policy to the AST validator."""
         if v is None:
             return None
-        stripped = v.strip()
-        if not stripped.lower().startswith("select"):
-            raise ValueError("sql must start with SELECT")
-        return stripped
+        return v.strip()
 
 
 def _format_scalar(value: Any) -> str:
@@ -215,6 +219,12 @@ class OpenRouterLLMClient:
             "temperature": temperature,
             "max_tokens": max_tokens,
             "stream": False,
+            # Reasoning models (gpt-5-nano, o-series) silently consume the
+            # entire token budget on reasoning and emit empty content when
+            # effort is not pinned. "minimal" is the cheapest reasoning-mode
+            # setting that still produces answer tokens; non-reasoning models
+            # ignore the field.
+            "reasoning": {"effort": "minimal"},
         }
         if json_mode:
             kwargs["response_format"] = {"type": "json_object"}
@@ -345,7 +355,10 @@ class OpenRouterLLMClient:
             result = self._chat(
                 messages,
                 temperature=0.0,
-                max_tokens=240,
+                # Reasoning models (e.g., gpt-5-nano) burn tokens on hidden
+                # reasoning before emitting content; even with effort=minimal
+                # we need headroom so the JSON body survives.
+                max_tokens=800,
                 json_mode=True,
                 stage="sql_generation",
                 request_id=request_id,
@@ -500,7 +513,9 @@ class OpenRouterLLMClient:
             result = self._chat(
                 messages,
                 temperature=0.2,
-                max_tokens=220,
+                # Same headroom as SQL gen — reasoning-model overhead applies
+                # here too for the answer-generation call.
+                max_tokens=800,
                 json_mode=False,
                 stage="answer_generation",
                 request_id=request_id,

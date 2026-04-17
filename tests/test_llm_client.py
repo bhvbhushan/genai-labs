@@ -172,10 +172,12 @@ class GenerateSQLTests(unittest.TestCase):
         self.assertTrue(out.sql.upper().startswith("SELECT"))
         self.assertIn("gender = 'Male'", out.sql)
 
-    def test_validator_rejection_non_select_returns_none(self) -> None:
-        # JSON-valid content with DROP — pydantic validator rejects. The
-        # fallback path searches for 'select ' in the raw content; since
-        # 'DROP' has no 'select', we end up with can_answer=False.
+    def test_non_select_sql_forwarded_to_validator(self) -> None:
+        # The client intentionally does NOT enforce SELECT-only at the
+        # pydantic layer — that is the SQLValidator's job. Non-SELECT SQL
+        # flows through so downstream layers can reject with a specific
+        # error code (pipeline status="invalid_sql") instead of the client
+        # swallowing it into can_answer=false/unanswerable.
         client = _make_client()
         client._client.chat.send = MagicMock(  # type: ignore[method-assign]
             return_value=_fake_response(
@@ -183,7 +185,7 @@ class GenerateSQLTests(unittest.TestCase):
             )
         )
         out = client.generate_sql("drop it all")
-        self.assertIsNone(out.sql)
+        self.assertEqual(out.sql, "DROP TABLE t")
         self.assertIsNone(out.error)
 
     def test_usage_missing_records_zeros(self) -> None:

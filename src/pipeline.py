@@ -1,152 +1,284 @@
-from __future__ import annotations
+"""AnalyticsPipeline — thin orchestrator wiring Lanes A+B+C together.
+
+The pipeline is ~four stages of orchestration and zero business logic. Each
+stage is a :class:`src.observability.Timer`-wrapped call into the component
+that owns the work:
+
+1. ``generate_sql``      → :class:`src.llm_client.OpenRouterLLMClient`
+2. ``validate``          → :class:`src.validator.SQLValidator`
+3. ``execute``           → :class:`SQLiteExecutor`
+4. ``generate_answer``   → :class:`src.llm_client.OpenRouterLLMClient`
+
+Status derivation is a single decision table in :func:`_derive_status` so
+the mapping from (gen, val, exec) stage outputs to ``PipelineOutput.status``
+lives in exactly one place. ``total_llm_stats`` aggregates across the two
+LLM stages so the evaluation harness sees the real token cost of the whole
+request.
+"""
 
 import sqlite3
 import time
+import uuid
 from pathlib import Path
+from typing import Any
 
-from src.llm_client import OpenRouterLLMClient, build_default_llm_client
-from src.types import (
-    SQLValidationOutput,
-    SQLExecutionOutput,
-    PipelineOutput,
+from src.config import Settings, get_settings
+from src.llm_client import OpenRouterLLMClient
+from src.observability import (
+    Timer,
+    configure_observability,
+    get_logger,
+    get_tracer,
+    log_event,
+    pipeline_requests_total,
+    stage_duration_ms,
 )
+from src.schema import SchemaCatalog
+from src.types import (
+    AnswerGenerationOutput,
+    PipelineOutput,
+    SQLExecutionOutput,
+    SQLGenerationOutput,
+    SQLValidationOutput,
+)
+from src.validator import SQLValidator
 
+_logger = get_logger(__name__)
 
-BASE_DIR = Path(__file__).resolve().parents[1]
-DEFAULT_DB_PATH = BASE_DIR / "data" / "gaming_mental_health.sqlite"
-
-
-class SQLValidationError(Exception):
-    pass
-
-
-class SQLValidator:
-    @classmethod
-    def validate(cls, sql: str | None) -> SQLValidationOutput:
-        start = time.perf_counter()
-
-        if sql is None:
-            return SQLValidationOutput(
-                is_valid=False,
-                validated_sql=None,
-                error="No SQL provided",
-                timing_ms=(time.perf_counter() - start) * 1000,
-            )
-
-        # TODO: Implement SQL validation logic
-        # Consider what validation is needed for this use case
-
-        return SQLValidationOutput(
-            is_valid=True,
-            validated_sql=sql,
-            error=None,
-            timing_ms=(time.perf_counter() - start) * 1000,
-        )
+# Progress-handler check interval (VM operations between abort checks).
+_PROGRESS_HANDLER_N = 100_000
 
 
 class SQLiteExecutor:
-    def __init__(self, db_path: str | Path = DEFAULT_DB_PATH) -> None:
-        self.db_path = Path(db_path)
+    """Read-only SQLite executor with row cap + statement deadline.
+
+    The connection is opened via the SQLite URI form ``file:path?mode=ro`` so
+    writes fail at the database level even before our AST validator catches
+    them. A ``progress_handler`` checks a monotonic deadline every
+    ~100k VM operations and aborts the running statement if exceeded.
+    """
+
+    def __init__(self, db_path: Path, *, row_cap: int = 100, timeout_s: float = 10.0) -> None:
+        self._db_path = db_path
+        self._row_cap = row_cap
+        self._timeout_s = timeout_s
 
     def run(self, sql: str | None) -> SQLExecutionOutput:
+        """Execute ``sql`` read-only; return rows + error inside the output dataclass."""
         start = time.perf_counter()
-        error = None
-        rows = []
-        row_count = 0
-
         if sql is None:
             return SQLExecutionOutput(
                 rows=[],
                 row_count=0,
-                timing_ms=(time.perf_counter() - start) * 1000,
+                timing_ms=(time.perf_counter() - start) * 1000.0,
                 error=None,
             )
 
+        rows: list[dict[str, Any]] = []
+        error: str | None = None
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            uri = f"file:{self._db_path}?mode=ro"
+            conn = sqlite3.connect(uri, uri=True, timeout=self._timeout_s)
+            try:
                 conn.row_factory = sqlite3.Row
+                deadline = time.perf_counter() + self._timeout_s
+
+                def _abort() -> int:
+                    # Return non-zero to abort the currently executing statement.
+                    return 1 if time.perf_counter() > deadline else 0
+
+                conn.set_progress_handler(_abort, _PROGRESS_HANDLER_N)
                 cur = conn.cursor()
                 cur.execute(sql)
-                rows = [dict(r) for r in cur.fetchmany(100)]
-                row_count = len(rows)
+                raw = cur.fetchmany(self._row_cap)
+                rows = [dict(r) for r in raw]
+            finally:
+                conn.close()
         except Exception as exc:
             error = str(exc)
             rows = []
-            row_count = 0
 
         return SQLExecutionOutput(
             rows=rows,
-            row_count=row_count,
-            timing_ms=(time.perf_counter() - start) * 1000,
+            row_count=len(rows),
+            timing_ms=(time.perf_counter() - start) * 1000.0,
             error=error,
         )
 
 
 class AnalyticsPipeline:
-    def __init__(self, db_path: str | Path = DEFAULT_DB_PATH, llm_client: OpenRouterLLMClient | None = None) -> None:
-        self.db_path = Path(db_path)
-        self.llm = llm_client or build_default_llm_client()
-        self.executor = SQLiteExecutor(self.db_path)
+    """Orchestrates SQL generation → validation → execution → answer generation."""
+
+    def __init__(
+        self,
+        db_path: Path | None = None,
+        *,
+        settings: Settings | None = None,
+        schema: SchemaCatalog | None = None,
+        llm_client: OpenRouterLLMClient | None = None,
+        executor: SQLiteExecutor | None = None,
+        validator: SQLValidator | None = None,
+    ) -> None:
+        configure_observability()
+        self._settings = settings or get_settings()
+        # Constructor arg wins over settings so tests/benchmark can point at
+        # alternate databases without mutating the global settings singleton.
+        resolved_db_path = db_path if db_path is not None else self._settings.db_path
+        self._schema = schema or SchemaCatalog.from_db(
+            resolved_db_path,
+            self._settings.table_name,
+        )
+        self._llm = llm_client or OpenRouterLLMClient(
+            api_key=self._settings.openrouter_api_key,
+            model=self._settings.model,
+            schema=self._schema,
+            timeout_s=self._settings.llm_timeout_s,
+            retries=self._settings.llm_retries,
+            retry_base_s=self._settings.llm_retry_base_s,
+            max_rows_to_llm=self._settings.max_rows_to_llm,
+        )
+        self._executor = executor or SQLiteExecutor(
+            resolved_db_path,
+            row_cap=self._settings.max_rows_return,
+            timeout_s=self._settings.sql_timeout_s,
+        )
+        self._validator = validator or SQLValidator(
+            self._schema,
+            row_limit=self._settings.sql_row_limit,
+        )
+        log_event(
+            _logger,
+            "pipeline_initialized",
+            table=self._settings.table_name,
+            columns=len(self._schema.columns),
+        )
 
     def run(self, question: str, request_id: str | None = None) -> PipelineOutput:
-        start = time.perf_counter()
+        """Execute the four stages and return a fully-populated ``PipelineOutput``."""
+        rid = request_id or uuid.uuid4().hex[:16]
+        log_event(_logger, "pipeline_start", request_id=rid, question=question)
 
-        # Stage 1: SQL Generation
-        sql_gen_output = self.llm.generate_sql(question, {})
-        sql = sql_gen_output.sql
+        tracer = get_tracer()
+        pipeline_start = time.perf_counter()
 
-        # Stage 2: SQL Validation
-        validation_output = SQLValidator.validate(sql)
-        if not validation_output.is_valid:
-            sql = None
+        with tracer.start_as_current_span("pipeline.run", attributes={"request_id": rid}):
+            # Stage 1: SQL generation.
+            with Timer("sql_generation"):
+                sql_gen = self._llm.generate_sql(question, request_id=rid)
+            if stage_duration_ms is not None:
+                stage_duration_ms.record(sql_gen.timing_ms, {"stage": "sql_generation"})
 
-        # Stage 3: SQL Execution
-        execution_output = self.executor.run(sql)
-        rows = execution_output.rows
+            # Stage 2: SQL validation.
+            with Timer("sql_validation"):
+                sql_val = self._validator.validate(sql_gen.sql, request_id=rid)
+            if stage_duration_ms is not None:
+                stage_duration_ms.record(sql_val.timing_ms, {"stage": "sql_validation"})
 
-        # Stage 4: Answer Generation
-        answer_output = self.llm.generate_answer(question, sql, rows)
+            # Stage 3: Execution (only when validation passed).
+            sql_for_exec = sql_val.validated_sql if sql_val.is_valid else None
+            with Timer("sql_execution"):
+                sql_exec = self._executor.run(sql_for_exec)
+            if stage_duration_ms is not None:
+                stage_duration_ms.record(sql_exec.timing_ms, {"stage": "sql_execution"})
 
-        # Determine status
-        status = "success"
-        if sql_gen_output.sql is None and sql_gen_output.error:
-            status = "unanswerable"
-        elif not validation_output.is_valid:
-            status = "invalid_sql"
-        elif execution_output.error:
-            status = "error"
-        elif sql is None:
-            status = "unanswerable"
+            # Stage 4: Answer generation.
+            with Timer("answer_generation"):
+                ans = self._llm.generate_answer(
+                    question,
+                    sql_for_exec,
+                    sql_exec.rows,
+                    request_id=rid,
+                )
+            if stage_duration_ms is not None:
+                stage_duration_ms.record(ans.timing_ms, {"stage": "answer_generation"})
 
-        # Build timings aggregate
-        timings = {
-            "sql_generation_ms": sql_gen_output.timing_ms,
-            "sql_validation_ms": validation_output.timing_ms,
-            "sql_execution_ms": execution_output.timing_ms,
-            "answer_generation_ms": answer_output.timing_ms,
-            "total_ms": (time.perf_counter() - start) * 1000,
+        status = _derive_status(sql_gen, sql_val, sql_exec)
+
+        total_ms = (time.perf_counter() - pipeline_start) * 1000.0
+        timings: dict[str, float] = {
+            "sql_generation_ms": sql_gen.timing_ms,
+            "sql_validation_ms": sql_val.timing_ms,
+            "sql_execution_ms": sql_exec.timing_ms,
+            "answer_generation_ms": ans.timing_ms,
+            "total_ms": total_ms,
         }
 
-        # Build total LLM stats
-        total_llm_stats = {
-            "llm_calls": sql_gen_output.llm_stats.get("llm_calls", 0) + answer_output.llm_stats.get("llm_calls", 0),
-            "prompt_tokens": sql_gen_output.llm_stats.get("prompt_tokens", 0) + answer_output.llm_stats.get("prompt_tokens", 0),
-            "completion_tokens": sql_gen_output.llm_stats.get("completion_tokens", 0) + answer_output.llm_stats.get("completion_tokens", 0),
-            "total_tokens": sql_gen_output.llm_stats.get("total_tokens", 0) + answer_output.llm_stats.get("total_tokens", 0),
-            "model": sql_gen_output.llm_stats.get("model", "unknown"),
-        }
+        total_llm_stats = _aggregate_llm_stats(sql_gen.llm_stats, ans.llm_stats)
+
+        if pipeline_requests_total is not None:
+            pipeline_requests_total.add(1, {"status": status})
+
+        log_event(
+            _logger,
+            "pipeline_complete",
+            request_id=rid,
+            stage="pipeline",
+            duration_ms=total_ms,
+            status=status,
+            tokens=total_llm_stats["total_tokens"],
+        )
 
         return PipelineOutput(
             status=status,
             question=question,
-            request_id=request_id,
-            sql_generation=sql_gen_output,
-            sql_validation=validation_output,
-            sql_execution=execution_output,
-            answer_generation=answer_output,
-            sql=sql,
-            rows=rows,
-            answer=answer_output.answer,
+            request_id=rid,
+            sql_generation=sql_gen,
+            sql_validation=sql_val,
+            sql_execution=sql_exec,
+            answer_generation=ans,
+            sql=sql_val.validated_sql if sql_val.is_valid else None,
+            rows=sql_exec.rows,
+            answer=ans.answer,
             timings=timings,
             total_llm_stats=total_llm_stats,
         )
+
+
+def _derive_status(
+    gen: SQLGenerationOutput,
+    val: SQLValidationOutput,
+    exec_: SQLExecutionOutput,
+) -> str:
+    """Map stage outputs to the terminal pipeline status (first match wins).
+
+    ======================================================  ==================
+    Condition                                               ``status``
+    ======================================================  ==================
+    ``gen.sql is None and gen.error is not None``           ``"error"``
+    ``gen.sql is None``                                     ``"unanswerable"``
+    ``val.is_valid is False``                               ``"invalid_sql"``
+    ``exec_.error is not None``                             ``"error"``
+    otherwise                                               ``"success"``
+    ======================================================  ==================
+    """
+    if gen.sql is None and gen.error is not None:
+        return "error"
+    if gen.sql is None:
+        return "unanswerable"
+    if not val.is_valid:
+        return "invalid_sql"
+    if exec_.error is not None:
+        return "error"
+    return "success"
+
+
+def _aggregate_llm_stats(a: dict[str, Any], b: dict[str, Any]) -> dict[str, Any]:
+    """Sum token/call counts across stages; pick the first non-empty model."""
+    return {
+        "llm_calls": int(a.get("llm_calls", 0)) + int(b.get("llm_calls", 0)),
+        "prompt_tokens": int(a.get("prompt_tokens", 0)) + int(b.get("prompt_tokens", 0)),
+        "completion_tokens": int(a.get("completion_tokens", 0))
+        + int(b.get("completion_tokens", 0)),
+        "total_tokens": int(a.get("total_tokens", 0)) + int(b.get("total_tokens", 0)),
+        "model": str(a.get("model") or b.get("model") or "unknown"),
+    }
+
+
+__all__ = [
+    "AnalyticsPipeline",
+    "AnswerGenerationOutput",
+    "SQLExecutionOutput",
+    "SQLGenerationOutput",
+    "SQLValidationOutput",
+    "SQLiteExecutor",
+]
