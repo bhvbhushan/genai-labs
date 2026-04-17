@@ -184,8 +184,9 @@ class SchemaCatalogTests(unittest.TestCase):
         self.assertIn("Columns:", prompt_a)
         # Categorical: comma-joined values.
         self.assertIn("- g (TEXT, categorical): Female, Male", prompt_a)
-        # Numeric: min dash max.
-        self.assertIn("- s (REAL, numeric): 0.0 – 10.0", prompt_a)  # noqa: RUF001
+        # Numeric: min dash max. Integer-valued floats render without .0
+        # so Likert scales and age ranges stay compact in the LLM prompt.
+        self.assertIn("- s (REAL, numeric): 0 – 10", prompt_a)  # noqa: RUF001
         # Text: line with no colon-list trailing.
         self.assertIn("- c (TEXT, text)\n", prompt_a + "\n")
         self.assertNotIn("- c (TEXT, text):", prompt_a)
@@ -245,6 +246,38 @@ class SchemaCatalogTests(unittest.TestCase):
         v = self._get(catalog, "v")
         self.assertEqual(v.kind, "categorical")
         self.assertEqual(v.sample_values, ("A",))
+
+    # 11. Identifier quoting with an embedded double-quote in the column name.
+    def test_quoted_identifier_with_embedded_double_quote(self) -> None:
+        # SQLite escape for a literal " inside a quoted identifier is "".
+        _seed(
+            self.db_path,
+            'CREATE TABLE t ("a""b" TEXT)',
+            [('INSERT INTO t ("a""b") VALUES (?)', [("alpha",), ("beta",)])],
+        )
+        catalog = SchemaCatalog.from_db(self.db_path, "t", sample_distinct_cap=5)
+        col = self._get(catalog, 'a"b')
+        self.assertEqual(col.kind, "categorical")
+        self.assertEqual(col.sample_values, ("alpha", "beta"))
+
+    # 12. BLOB columns are rendered as text with no bytes-repr leakage.
+    def test_blob_column_not_rendered_as_repr(self) -> None:
+        _seed(
+            self.db_path,
+            "CREATE TABLE t (payload BLOB)",
+            [("INSERT INTO t VALUES (?)", [(b"\x00\x01",), (b"\x02\x03",)])],
+        )
+        catalog = SchemaCatalog.from_db(self.db_path, "t")
+        payload = self._get(catalog, "payload")
+        self.assertEqual(payload.kind, "text")
+        self.assertIsNone(payload.sample_values)
+        self.assertFalse(payload.all_null)
+
+        prompt = catalog.to_prompt()
+        self.assertIn("- payload (BLOB, text)", prompt)
+        self.assertNotIn("b'", prompt)
+        self.assertNotIn('b"', prompt)
+        self.assertNotIn("\\x", prompt)
 
 
 if __name__ == "__main__":

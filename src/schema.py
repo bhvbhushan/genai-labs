@@ -22,6 +22,9 @@ _logger = get_logger(__name__)
 # SQLite declared-type prefixes that map to the "numeric" kind.
 _NUMERIC_TYPE_PREFIXES: tuple[str, ...] = ("INT", "REAL", "FLOA", "DOUB", "NUM", "DEC")
 
+# SQLite declared-type prefixes that indicate BLOB affinity.
+_BLOB_TYPE_PREFIXES: tuple[str, ...] = ("BLOB", "BYTEA")
+
 
 def _quote_ident(name: str) -> str:
     """Double-quote a SQLite identifier, escaping embedded double-quotes."""
@@ -32,6 +35,19 @@ def _is_numeric_type(sql_type: str) -> bool:
     """Classify a declared SQLite type as numeric per SQLite affinity rules."""
     upper = sql_type.upper()
     return any(upper.startswith(prefix) for prefix in _NUMERIC_TYPE_PREFIXES)
+
+
+def _is_blob_type(sql_type: str) -> bool:
+    """Classify a declared SQLite type as BLOB affinity."""
+    upper = sql_type.upper()
+    return any(upper.startswith(prefix) for prefix in _BLOB_TYPE_PREFIXES)
+
+
+def _format_num(value: float) -> str:
+    """Render a numeric value for LLM prompts; drop trailing .0 for ints."""
+    if value == int(value):
+        return str(int(value))
+    return str(value)
 
 
 class ColumnInfo(BaseModel):
@@ -66,6 +82,10 @@ class SchemaCatalog(BaseModel):
         sample_distinct_cap: int = 20,
     ) -> "SchemaCatalog":
         """Introspect ``table`` in the SQLite file at ``db_path`` (read-only)."""
+        if sample_rows <= 0:
+            raise ValueError(f"sample_rows must be positive, got {sample_rows}")
+        if sample_distinct_cap <= 0:
+            raise ValueError(f"sample_distinct_cap must be positive, got {sample_distinct_cap}")
         with Timer() as timer:
             uri = f"file:{db_path}?mode=ro"
             conn = sqlite3.connect(uri, uri=True)
@@ -141,6 +161,19 @@ def _classify_column(
     quoted_col = _quote_ident(col_name)
     quoted_table = _quote_ident(table)
     is_numeric = _is_numeric_type(sql_type)
+    is_blob = _is_blob_type(sql_type)
+
+    # BLOB: short-circuit to text kind with no sample values — avoids leaking
+    # Python bytes-repr (b'\\x00...') into the LLM prompt.
+    if is_blob:
+        probe_sql = f"SELECT 1 FROM {quoted_table} WHERE {quoted_col} IS NOT NULL LIMIT 1"
+        probe = conn.execute(probe_sql).fetchone()
+        return ColumnInfo(
+            name=col_name,
+            sql_type=sql_type,
+            kind="text",
+            all_null=probe is None,
+        )
 
     distinct_sql = (
         f"SELECT DISTINCT {quoted_col} FROM "
@@ -154,7 +187,14 @@ def _classify_column(
         return ColumnInfo(name=col_name, sql_type=sql_type, kind=kind, all_null=True)
 
     if len(rows) <= sample_distinct_cap:
-        values = tuple(sorted(str(r[0]) for r in rows))
+        if is_numeric:
+            # Sort numerically so Likert-style values render as 0,1,2,...10
+            # rather than the lexicographic 1,10,2,3,... — cleaner prompt +
+            # stops the LLM from inferring a string enum.
+            sorted_numeric = sorted(float(r[0]) for r in rows)
+            values = tuple(_format_num(v) for v in sorted_numeric)
+        else:
+            values = tuple(sorted(str(r[0]) for r in rows))
         return ColumnInfo(
             name=col_name,
             sql_type=sql_type,
@@ -188,5 +228,5 @@ def _render_column(col: ColumnInfo) -> str:
     if col.kind == "categorical" and col.sample_values is not None:
         return f"{prefix}: {', '.join(col.sample_values)}"
     if col.kind == "numeric" and col.min_value is not None and col.max_value is not None:
-        return f"{prefix}: {col.min_value} – {col.max_value}"  # noqa: RUF001
+        return f"{prefix}: {_format_num(col.min_value)} – {_format_num(col.max_value)}"  # noqa: RUF001
     return prefix
