@@ -23,6 +23,11 @@ statement the user asked for.
 - Reference only columns that exist in the schema above.
 - Set can_answer=false only when the question truly cannot be mapped to the \
 given schema (for example, asks about a column that does not exist).
+- If the question references concepts NOT represented by any column \
+in the schema above — for example: zodiac sign, horoscope, star sign, \
+religion, political party, favorite color, personality type, ethnicity \
+(unless a column for it exists) — return can_answer=false. Do not \
+substitute a related column to make the question appear answerable.
 
 Output: return strictly one JSON object with this shape and no prose:
 {{"can_answer": bool, "sql": string | null, "reason": string | null}}

@@ -8,13 +8,26 @@ BACKEND_ROOT = Path(__file__).resolve().parents[1]
 if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
 
-from src.schema import SchemaCatalog  # noqa: E402
+from src.schema import ColumnInfo, SchemaCatalog  # noqa: E402
 from src.validator import SQLValidator  # noqa: E402
 
 
 def _make_validator(row_limit: int = 1000) -> SQLValidator:
     """Build a validator whose allowlist is the single table ``"t"``."""
     schema = SchemaCatalog(table="t", columns=())
+    return SQLValidator(schema, row_limit=row_limit)
+
+
+def _make_validator_with_columns(row_limit: int = 1000) -> SQLValidator:
+    """Build a validator with a small column allowlist on ``gaming_mental_health``."""
+    schema = SchemaCatalog(
+        table="gaming_mental_health",
+        columns=(
+            ColumnInfo(name="age", sql_type="INTEGER", kind="numeric"),
+            ColumnInfo(name="addiction_level", sql_type="REAL", kind="numeric"),
+            ColumnInfo(name="gender", sql_type="TEXT", kind="categorical"),
+        ),
+    )
     return SQLValidator(schema, row_limit=row_limit)
 
 
@@ -232,6 +245,56 @@ class SQLValidatorTests(unittest.TestCase):
         self.assertFalse(out.is_valid)
         assert out.error is not None
         self.assertIn("Qualified", out.error)
+
+    # 29. Column allowlist: unknown column is rejected.
+    def test_unknown_column_rejected(self) -> None:
+        out = _make_validator_with_columns().validate(
+            "SELECT zodiac_sign FROM gaming_mental_health"
+        )
+        self.assertFalse(out.is_valid)
+        assert out.error is not None
+        self.assertIn("zodiac_sign", out.error)
+
+    # 30. Column allowlist: known column is accepted.
+    def test_known_column_accepted(self) -> None:
+        out = _make_validator_with_columns().validate(
+            "SELECT addiction_level FROM gaming_mental_health"
+        )
+        self.assertTrue(out.is_valid, msg=out.error)
+
+    # 31. Outer-SELECT alias is not treated as an unknown column when it
+    # is later referenced in HAVING / ORDER BY.
+    def test_column_alias_in_output_is_not_treated_as_unknown(self) -> None:
+        out = _make_validator_with_columns().validate("SELECT age AS a FROM gaming_mental_health")
+        self.assertTrue(out.is_valid, msg=out.error)
+
+    # 32. CTE output name referenced in outer SELECT is allowed.
+    def test_cte_output_referenced_in_outer_select_is_allowed(self) -> None:
+        out = _make_validator_with_columns().validate(
+            "WITH c AS (SELECT age AS x FROM gaming_mental_health) SELECT x FROM c"
+        )
+        self.assertTrue(out.is_valid, msg=out.error)
+
+    # 33. COUNT(*) does not trip the column allowlist (star projection).
+    def test_count_star_accepted(self) -> None:
+        out = _make_validator_with_columns().validate("SELECT COUNT(*) FROM gaming_mental_health")
+        self.assertTrue(out.is_valid, msg=out.error)
+
+    # 34. Aggregate over a known column is accepted.
+    def test_aggregate_over_known_column_accepted(self) -> None:
+        out = _make_validator_with_columns().validate(
+            "SELECT AVG(addiction_level) FROM gaming_mental_health"
+        )
+        self.assertTrue(out.is_valid, msg=out.error)
+
+    # 35. Aggregate over an unknown column is rejected.
+    def test_aggregate_over_unknown_column_rejected(self) -> None:
+        out = _make_validator_with_columns().validate(
+            "SELECT AVG(horoscope) FROM gaming_mental_health"
+        )
+        self.assertFalse(out.is_valid)
+        assert out.error is not None
+        self.assertIn("horoscope", out.error)
 
 
 if __name__ == "__main__":
