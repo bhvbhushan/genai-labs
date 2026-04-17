@@ -6,7 +6,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from unittest.mock import MagicMock
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
@@ -407,7 +407,7 @@ class MultiTurnTests(unittest.TestCase):
         # Seed with prior turn so history is non-empty.
         pipe.run("addiction by gender", conversation_id="c1")
 
-        llm_mock = pipe._llm  # type: ignore[attr-defined]
+        llm_mock = cast("MagicMock", pipe._llm)
         llm_mock.generate_sql.reset_mock()
         llm_mock.generate_answer.reset_mock()
 
@@ -441,7 +441,7 @@ class MultiTurnTests(unittest.TestCase):
         )
         pipe.run("show values", conversation_id="c1")
 
-        llm_mock = pipe._llm  # type: ignore[attr-defined]
+        llm_mock = cast("MagicMock", pipe._llm)
         llm_mock.generate_sql.reset_mock()
         llm_mock.generate_answer.reset_mock()
         # Configure answer for the reinterpret call.
@@ -486,7 +486,7 @@ class MultiTurnTests(unittest.TestCase):
         )
         pipe.run("q1", conversation_id="c1")
 
-        llm_mock = pipe._llm  # type: ignore[attr-defined]
+        llm_mock = cast("MagicMock", pipe._llm)
         llm_mock.generate_sql.reset_mock()
 
         pipe.run("completely different question", conversation_id="c1")
