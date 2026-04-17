@@ -21,6 +21,7 @@ from src.pipeline import (  # noqa: E402
     _aggregate_llm_stats,
     _derive_status,
 )
+from src.response_cache import ResponseCache  # noqa: E402
 from src.schema import SchemaCatalog  # noqa: E402
 from src.types import (  # noqa: E402
     AnswerGenerationOutput,
@@ -105,6 +106,7 @@ def _make_pipeline(
     ans: AnswerGenerationOutput | None = None,
     conversation_store: ConversationStore | None = None,
     followup_classifier: Any = None,
+    response_cache: ResponseCache | None = None,
 ) -> AnalyticsPipeline:
     """Build an AnalyticsPipeline with fully mocked components (no I/O)."""
     llm = MagicMock()
@@ -126,6 +128,7 @@ def _make_pipeline(
         executor=executor,
         conversation_store=conversation_store,
         followup_classifier=followup_classifier,
+        response_cache=response_cache,
     )
 
 
@@ -498,6 +501,82 @@ class MultiTurnTests(unittest.TestCase):
         self.assertEqual(history[-1].intent, "NEW_QUERY")
         # NEW_QUERY stores no rewritten_question.
         self.assertIsNone(history[-1].rewritten_question)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Response cache integration
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class ResponseCacheIntegrationTests(unittest.TestCase):
+    def test_first_call_runs_pipeline_then_caches(self) -> None:
+        cache = ResponseCache()
+        pipe = _make_pipeline(response_cache=cache)
+        result = pipe.run("same question")
+        self.assertEqual(result.status, "success")
+        # Full pipeline ran once.
+        llm_mock = cast("MagicMock", pipe._llm)
+        self.assertEqual(llm_mock.generate_sql.call_count, 1)
+        # And the result is now cached.
+        self.assertIn("same question", cache)
+
+    def test_second_call_is_a_cache_hit(self) -> None:
+        cache = ResponseCache()
+        pipe = _make_pipeline(response_cache=cache)
+        pipe.run("same question")
+        llm_mock = cast("MagicMock", pipe._llm)
+        llm_mock.generate_sql.reset_mock()
+        llm_mock.generate_answer.reset_mock()
+
+        result = pipe.run("same question")
+        self.assertEqual(result.status, "success")
+        # No LLM work on the second call.
+        self.assertFalse(llm_mock.generate_sql.called)
+        self.assertFalse(llm_mock.generate_answer.called)
+        # Zero'd stats on a cache hit.
+        self.assertEqual(result.total_llm_stats["total_tokens"], 0)
+        # And the cache_hit marker is visible.
+        self.assertEqual(
+            result.sql_generation.intermediate_outputs[0],
+            {"cache_hit": True},
+        )
+
+    def test_multi_turn_bypasses_cache(self) -> None:
+        cache = ResponseCache()
+        store = ConversationStore()
+        classifier = MagicMock()
+        classifier.classify_and_rewrite.return_value = FollowupResponse(
+            intent="NEW_QUERY",
+            rewritten_question="q",
+            reuses_prior_rows=False,
+        )
+        pipe = _make_pipeline(
+            response_cache=cache,
+            conversation_store=store,
+            followup_classifier=classifier,
+        )
+        pipe.run("q", conversation_id="c1")
+        pipe.run("q", conversation_id="c1")
+        # Cache was not populated — conversation paths always go full pipeline.
+        self.assertNotIn("q", cache)
+        llm_mock = cast("MagicMock", pipe._llm)
+        # Both turns hit generate_sql.
+        self.assertEqual(llm_mock.generate_sql.call_count, 2)
+
+    def test_failed_status_is_not_cached(self) -> None:
+        cache = ResponseCache()
+        # Validator fails → invalid_sql status.
+        pipe = _make_pipeline(
+            val=_make_val(is_valid=False, error="Non-SELECT"),
+            response_cache=cache,
+        )
+        result1 = pipe.run("bad q")
+        self.assertEqual(result1.status, "invalid_sql")
+        self.assertNotIn("bad q", cache)
+        llm_mock = cast("MagicMock", pipe._llm)
+        # Second call re-runs the pipeline.
+        pipe.run("bad q")
+        self.assertEqual(llm_mock.generate_sql.call_count, 2)
 
 
 # Silence the root logger's JsonFormatter noise during mocked tests so

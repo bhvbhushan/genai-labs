@@ -100,6 +100,10 @@ llm_calls_total: Counter | None = None
 llm_short_circuit_total: Counter | None = None
 llm_json_fallback_total: Counter | None = None
 llm_usage_missing_total: Counter | None = None
+response_cache_hits_total: Counter | None = None
+response_cache_misses_total: Counter | None = None
+result_validation_warnings_total: Counter | None = None
+answer_hallucinations_total: Counter | None = None
 
 _CONFIGURED: bool = False
 _LOCK = threading.Lock()
@@ -201,10 +205,12 @@ def _build_span_exporter(
 
 
 def _register_instruments(meter_provider: APIMeterProvider) -> None:
-    """Create the seven module-level instruments against ``meter_provider``."""
+    """Create the module-level instruments against ``meter_provider``."""
     global pipeline_requests_total, stage_duration_ms, llm_tokens_total
     global llm_calls_total, llm_short_circuit_total, llm_json_fallback_total
     global llm_usage_missing_total
+    global response_cache_hits_total, response_cache_misses_total
+    global result_validation_warnings_total, answer_hallucinations_total
 
     meter = meter_provider.get_meter(_METER_NAME)
 
@@ -241,6 +247,26 @@ def _register_instruments(meter_provider: APIMeterProvider) -> None:
     llm_usage_missing_total = meter.create_counter(
         name="llm_usage_missing_total",
         description="LLM responses lacking token-usage metadata, by stage.",
+        unit="1",
+    )
+    response_cache_hits_total = meter.create_counter(
+        name="response_cache_hits_total",
+        description="ResponseCache hits — requests served without calling the LLM.",
+        unit="1",
+    )
+    response_cache_misses_total = meter.create_counter(
+        name="response_cache_misses_total",
+        description="ResponseCache misses — requests that fell through to the pipeline.",
+        unit="1",
+    )
+    result_validation_warnings_total = meter.create_counter(
+        name="result_validation_warnings_total",
+        description="Schema-aware plausibility warnings on executed rows, by kind.",
+        unit="1",
+    )
+    answer_hallucinations_total = meter.create_counter(
+        name="answer_hallucinations_total",
+        description="Answer-generation responses with numeric claims not found in rows.",
         unit="1",
     )
 
@@ -292,6 +318,8 @@ def _reset_for_testing() -> None:
     global _CONFIGURED, pipeline_requests_total, stage_duration_ms
     global llm_tokens_total, llm_calls_total, llm_short_circuit_total
     global llm_json_fallback_total, llm_usage_missing_total
+    global response_cache_hits_total, response_cache_misses_total
+    global result_validation_warnings_total, answer_hallucinations_total
     with _LOCK:
         _CONFIGURED = False
         pipeline_requests_total = None
@@ -301,6 +329,10 @@ def _reset_for_testing() -> None:
         llm_short_circuit_total = None
         llm_json_fallback_total = None
         llm_usage_missing_total = None
+        response_cache_hits_total = None
+        response_cache_misses_total = None
+        result_validation_warnings_total = None
+        answer_hallucinations_total = None
 
 
 def get_logger(name: str) -> logging.Logger:

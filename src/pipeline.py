@@ -41,8 +41,11 @@ from src.observability import (
     get_tracer,
     log_event,
     pipeline_requests_total,
+    response_cache_hits_total,
+    response_cache_misses_total,
     stage_duration_ms,
 )
+from src.response_cache import ResponseCache
 from src.schema import SchemaCatalog
 from src.types import (
     AnswerGenerationOutput,
@@ -133,6 +136,7 @@ class AnalyticsPipeline:
         validator: SQLValidator | None = None,
         conversation_store: ConversationStore | None = None,
         followup_classifier: FollowupClassifier | None = None,
+        response_cache: ResponseCache | None = None,
     ) -> None:
         configure_observability()
         self._settings = settings or get_settings()
@@ -169,6 +173,7 @@ class AnalyticsPipeline:
             if followup_classifier is not None
             else FollowupClassifier(self._llm)
         )
+        self._response_cache = response_cache if response_cache is not None else ResponseCache()
         log_event(
             _logger,
             "pipeline_initialized",
@@ -198,6 +203,27 @@ class AnalyticsPipeline:
             conversation_id=conversation_id,
         )
 
+        # Response cache: single-turn only. Multi-turn goes through the
+        # conversation-aware path so follow-up classification still sees the
+        # full history. Lookup happens BEFORE any LLM work.
+        if conversation_id is None:
+            cached = self._response_cache.get(question)
+            if cached is not None:
+                cached.request_id = rid
+                log_event(
+                    _logger,
+                    "response_cache_hit",
+                    request_id=rid,
+                    question=question,
+                )
+                if response_cache_hits_total is not None:
+                    response_cache_hits_total.add(1)
+                if pipeline_requests_total is not None:
+                    pipeline_requests_total.add(1, {"status": "success", "cache": "hit"})
+                return cached
+            if response_cache_misses_total is not None:
+                response_cache_misses_total.add(1)
+
         # Multi-turn: classify + maybe rewrite against recent history.
         effective_question = question
         followup: FollowupResponse | None = None
@@ -226,6 +252,10 @@ class AnalyticsPipeline:
 
         if conversation_id:
             self._record_turn(conversation_id, question, followup, output)
+        elif output.status == "success":
+            # Cache only successful single-turn results. Errors / unanswerables
+            # must be retried so they get a fresh chance to succeed.
+            self._response_cache.put(question, output)
 
         return output
 

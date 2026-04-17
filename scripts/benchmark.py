@@ -77,6 +77,13 @@ def main() -> None:
             success += int(result.status == "success")
             count += 1
 
+    cache = pipeline._response_cache
+    cache_stats = {
+        "hits": cache.stats.hits,
+        "misses": cache.stats.misses,
+        "hit_rate": round(cache.stats.hit_rate, 4),
+    }
+
     summary = {
         "runs": args.runs,
         "samples": count,
@@ -89,6 +96,7 @@ def main() -> None:
         "p95_total_tokens": round(percentile(total_tokens, 95), 2),
         "avg_llm_calls": round(statistics.fmean(llm_calls), 4) if llm_calls else 0.0,
         "status_breakdown": dict(status_counter),
+        "cache_stats": cache_stats,
     }
     print(json.dumps(summary, indent=2))
 
