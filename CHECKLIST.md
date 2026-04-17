@@ -166,7 +166,7 @@ where most of the token savings come from.
     `unanswerable` / `invalid_sql` / `success`. Each stage catches
     its own boundary exceptions, wraps them into the stage's output
     dataclass, and never raises past `pipeline.run`. The public test
-    `test_handles_destructive_query_gracefully` now correctly gets
+    `test_invalid_sql_is_rejected` now correctly gets
     `status="invalid_sql"` (was `status="unanswerable"` in baseline
     because the LLM was self-censoring).
 
