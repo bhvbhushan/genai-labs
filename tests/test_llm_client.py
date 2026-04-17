@@ -15,8 +15,10 @@ from src.config import Settings, get_settings  # noqa: E402
 from src.llm_client import (  # noqa: E402
     OpenRouterLLMClient,
     SQLGenerationResponse,
+    _answer_fidelity_warnings,
     _format_scalar,
     _is_auth_error,
+    _plausible_numbers,
     _rows_to_csv,
     build_default_llm_client,
 )
@@ -327,6 +329,83 @@ class GenerateAnswerTests(unittest.TestCase):
         self.assertIn("0", user_msg)
         self.assertIn("1", user_msg)
         self.assertNotIn("\n2\n", user_msg)
+
+    # ------------------------------------------------------------------
+    # Numeric fidelity check (flags hallucinated numbers in the answer)
+    # ------------------------------------------------------------------
+
+    def test_fidelity_clean_when_claim_in_rows(self) -> None:
+        client = _make_client()
+        client._client.chat.send = MagicMock(  # type: ignore[method-assign]
+            return_value=_fake_response("The answer is 2000."),
+        )
+        rows = [{"gender": "Male", "n": 2000}, {"gender": "Female", "n": 1000}]
+        out = client.generate_answer("?", "SELECT gender, n FROM t", rows)
+        self.assertEqual(out.intermediate_outputs, [])
+
+    def test_fidelity_clean_when_claim_is_column_average(self) -> None:
+        client = _make_client()
+        client._client.chat.send = MagicMock(  # type: ignore[method-assign]
+            return_value=_fake_response("The average is 5.0."),
+        )
+        rows = [{"v": 1}, {"v": 5}, {"v": 9}]  # avg = 5.0
+        out = client.generate_answer("?", "SELECT v FROM t", rows)
+        self.assertEqual(out.intermediate_outputs, [])
+
+    def test_fidelity_clean_when_claim_is_row_count(self) -> None:
+        client = _make_client()
+        client._client.chat.send = MagicMock(  # type: ignore[method-assign]
+            return_value=_fake_response("There are 3 rows."),
+        )
+        rows = [{"v": 100}, {"v": 200}, {"v": 300}]
+        out = client.generate_answer("?", "SELECT v FROM t", rows)
+        self.assertEqual(out.intermediate_outputs, [])
+
+    def test_fidelity_flags_invented_numeric_claim(self) -> None:
+        client = _make_client()
+        client._client.chat.send = MagicMock(  # type: ignore[method-assign]
+            return_value=_fake_response("The answer is 9999."),
+        )
+        rows = [{"v": 1}, {"v": 5}]
+        out = client.generate_answer("?", "SELECT v FROM t", rows)
+        self.assertEqual(len(out.intermediate_outputs), 1)
+        self.assertIn("suspicious_numeric_claims", out.intermediate_outputs[0])
+        claims = out.intermediate_outputs[0]["suspicious_numeric_claims"]
+        self.assertIn("9999.0", claims)
+
+    def test_fidelity_short_circuit_skipped(self) -> None:
+        # 1x1 scalar answers never hit the fidelity check (they never invoke
+        # the LLM). No intermediate_outputs should contain a suspicious list.
+        client = _make_client()
+        out = client.generate_answer("?", "SELECT COUNT(*) FROM t", [{"c": 42}])
+        for io_ in out.intermediate_outputs:
+            self.assertNotIn("suspicious_numeric_claims", io_)
+
+
+class AnswerFidelityHelperTests(unittest.TestCase):
+    def test_plausible_numbers_empty_rows_returns_zero(self) -> None:
+        self.assertEqual(_plausible_numbers([]), {0.0})
+
+    def test_plausible_numbers_includes_count_min_max_sum_avg(self) -> None:
+        rows = [{"v": 1}, {"v": 5}, {"v": 9}]
+        plausible = _plausible_numbers(rows)
+        self.assertIn(3.0, plausible)  # row count
+        self.assertIn(1.0, plausible)  # min
+        self.assertIn(9.0, plausible)  # max
+        self.assertIn(15.0, plausible)  # sum
+        self.assertIn(5.0, plausible)  # avg
+
+    def test_answer_fidelity_warnings_no_numbers(self) -> None:
+        self.assertEqual(
+            _answer_fidelity_warnings("no numeric content here", [{"v": 1}]),
+            [],
+        )
+
+    def test_answer_fidelity_warnings_bool_not_counted_as_numeric(self) -> None:
+        # Bool is a subclass of int but must not leak into plausible.
+        rows = [{"v": True}, {"v": False}]
+        # "3" is not among plausible (no numerics cached); expect flagged.
+        self.assertEqual(_answer_fidelity_warnings("About 3.", rows), ["3.0"])
 
 
 class HelperFunctionTests(unittest.TestCase):

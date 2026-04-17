@@ -23,6 +23,7 @@ import csv
 import io
 import json
 import random
+import re
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -32,6 +33,7 @@ from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
 
 from src.config import get_settings
 from src.observability import (
+    answer_hallucinations_total,
     get_logger,
     llm_calls_total,
     llm_json_fallback_total,
@@ -56,6 +58,71 @@ _NO_ROWS_MESSAGE = "The query returned no matching rows."
 _UNPARSEABLE_REASON = "LLM output could not be parsed as SQL"
 
 _AUTH_MARKERS: tuple[str, ...] = ("unauthorized", "api key", "invalid_api_key")
+
+_NUMBER_RE = re.compile(r"-?\d+(?:\.\d+)?")
+
+
+def _numbers_in(text: str) -> list[float]:
+    """Extract every numeric substring from ``text`` as a float."""
+    return [float(m) for m in _NUMBER_RE.findall(text)]
+
+
+def _plausible_numbers(rows: list[dict[str, Any]]) -> set[float]:
+    """Numbers that could legitimately appear in an answer about these rows.
+
+    Includes raw cell values, per-column min/max/sum/avg, and the row count.
+    The empty-rows case returns just ``{0.0}`` so phrasing like "0 rows" is
+    not flagged.
+    """
+    plausible: set[float] = set()
+    if not rows:
+        plausible.add(0.0)
+        return plausible
+    plausible.add(float(len(rows)))
+    by_col: dict[str, list[float]] = {}
+    for row in rows:
+        for k, v in row.items():
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                fv = float(v)
+                plausible.add(fv)
+                by_col.setdefault(k, []).append(fv)
+    for vals in by_col.values():
+        if not vals:
+            continue
+        plausible.add(min(vals))
+        plausible.add(max(vals))
+        plausible.add(round(sum(vals), 6))
+        plausible.add(round(sum(vals) / len(vals), 6))
+    return plausible
+
+
+def _matches_any(claim: float, plausible: set[float]) -> bool:
+    """Return True if ``claim`` matches any plausible number within tolerance."""
+    abs_tol = 0.015
+    rel_tol = 0.01
+    for p in plausible:
+        if abs(claim - p) <= abs_tol:
+            return True
+        if p != 0 and abs(claim - p) / abs(p) <= rel_tol:
+            return True
+        # Also compare to the rounded integer — the LLM often says
+        # "approximately 5" when the true value is 4.998.
+        if abs(claim - round(p)) <= abs_tol:
+            return True
+    return False
+
+
+def _answer_fidelity_warnings(answer: str, rows: list[dict[str, Any]]) -> list[str]:
+    """Return a list of suspicious numeric claims in ``answer``.
+
+    A "suspicious" claim is a number found in the answer text that doesn't
+    match any raw row value, per-column aggregate, or the row count.
+    """
+    claims = _numbers_in(answer)
+    if not claims:
+        return []
+    plausible = _plausible_numbers(rows)
+    return [str(claim) for claim in claims if not _matches_any(claim, plausible)]
 
 
 @dataclass(frozen=True)
@@ -561,11 +628,25 @@ class OpenRouterLLMClient:
                 error=str(exc),
             )
 
+        suspicious = _answer_fidelity_warnings(result.content, rows)
+        intermediate: list[dict[str, Any]] = []
+        if suspicious:
+            intermediate.append({"suspicious_numeric_claims": suspicious})
+            if answer_hallucinations_total is not None:
+                answer_hallucinations_total.add(1)
+            log_event(
+                _logger,
+                "answer_fidelity_warning",
+                request_id=request_id,
+                stage="answer_generation",
+                claims=", ".join(suspicious),
+            )
+
         return AnswerGenerationOutput(
             answer=result.content,
             timing_ms=(time.perf_counter() - start) * 1000.0,
             llm_stats=_stats_from_result(result, self._model),
-            intermediate_outputs=[],
+            intermediate_outputs=intermediate,
             error=None,
         )
 
