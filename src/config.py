@@ -24,6 +24,7 @@ class Settings(BaseSettings):
     # OpenRouter — uses unprefixed env vars (stock names from .env.example).
     openrouter_api_key: str = Field(
         validation_alias=AliasChoices("OPENROUTER_API_KEY", "openrouter_api_key"),
+        min_length=1,
     )
     model: str = Field(
         default="openai/gpt-5-nano",
@@ -35,17 +36,17 @@ class Settings(BaseSettings):
     table_name: str = Field(default="gaming_mental_health")
 
     # Row limits
-    max_rows_return: int = Field(default=100)
-    max_rows_to_llm: int = Field(default=30)
-    sql_row_limit: int = Field(default=1000)
+    max_rows_return: int = Field(default=100, ge=1)
+    max_rows_to_llm: int = Field(default=30, ge=1)
+    sql_row_limit: int = Field(default=1000, ge=1)
 
     # Timeouts
-    sql_timeout_s: float = Field(default=10.0)
-    llm_timeout_s: float = Field(default=30.0)
+    sql_timeout_s: float = Field(default=10.0, gt=0)
+    llm_timeout_s: float = Field(default=30.0, gt=0)
 
     # Retry
-    llm_retries: int = Field(default=1)
-    llm_retry_base_s: float = Field(default=0.3)
+    llm_retries: int = Field(default=1, ge=0)
+    llm_retry_base_s: float = Field(default=0.3, gt=0)
 
     # Logging
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = Field(default="INFO")

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -89,14 +90,15 @@ class SettingsTests(unittest.TestCase):
 
     def test_get_settings_caches(self) -> None:
         env = {"OPENROUTER_API_KEY": "sk-test-cache"}
-        with patch.dict(os.environ, env, clear=True):
-            get_settings.cache_clear()
-            # Patch _env_file default to None for this call path by
-            # constructing via a side-effect-free factory: re-use the public
-            # entry point and assert identity.
-            first = get_settings()
-            second = get_settings()
-
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, env, clear=True):
+            cwd = Path.cwd()
+            os.chdir(tmp)
+            try:
+                get_settings.cache_clear()
+                first = get_settings()
+                second = get_settings()
+            finally:
+                os.chdir(cwd)
         self.assertIs(first, second)
 
     def test_llm_retries_zero_accepted(self) -> None:
@@ -108,6 +110,25 @@ class SettingsTests(unittest.TestCase):
             settings = Settings(_env_file=None)  # type: ignore[call-arg]
 
         self.assertEqual(settings.llm_retries, 0)
+
+    def test_negative_max_rows_return_rejected(self) -> None:
+        env = {
+            "OPENROUTER_API_KEY": "sk-test",
+            "PIPELINE_MAX_ROWS_RETURN": "-1",
+        }
+        with (
+            patch.dict(os.environ, env, clear=True),
+            self.assertRaises(pydantic.ValidationError),
+        ):
+            Settings(_env_file=None)  # type: ignore[call-arg]
+
+    def test_empty_api_key_rejected(self) -> None:
+        env = {"OPENROUTER_API_KEY": ""}
+        with (
+            patch.dict(os.environ, env, clear=True),
+            self.assertRaises(pydantic.ValidationError),
+        ):
+            Settings(_env_file=None)  # type: ignore[call-arg]
 
     def test_settings_frozen(self) -> None:
         env = {"OPENROUTER_API_KEY": "sk-test"}
