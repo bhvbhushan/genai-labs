@@ -31,15 +31,10 @@ from typing import Any
 from openrouter import OpenRouter
 from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
 
+from src import observability as _obs
 from src.config import get_settings
 from src.observability import (
-    answer_hallucinations_total,
     get_logger,
-    llm_calls_total,
-    llm_json_fallback_total,
-    llm_short_circuit_total,
-    llm_tokens_total,
-    llm_usage_missing_total,
     log_event,
 )
 from src.prompts import (
@@ -343,20 +338,20 @@ class OpenRouterLLMClient:
             except Exception as exc:
                 last_exc = exc
                 if _is_auth_error(exc):
-                    if llm_calls_total is not None:
-                        llm_calls_total.add(1, {"stage": stage, "outcome": "error"})
+                    if _obs.llm_calls_total is not None:
+                        _obs.llm_calls_total.add(1, {"stage": stage, "outcome": "error"})
                     raise
                 # Transient error path.
                 if attempt < attempts - 1:
-                    if llm_calls_total is not None:
-                        llm_calls_total.add(1, {"stage": stage, "outcome": "retry"})
+                    if _obs.llm_calls_total is not None:
+                        _obs.llm_calls_total.add(1, {"stage": stage, "outcome": "retry"})
                     # Jittered constant backoff per plan: base * U(0.7, 1.3).
                     delay = self._retry_base_s * random.uniform(0.7, 1.3)
                     time.sleep(delay)
                     continue
                 # No retries left.
-                if llm_calls_total is not None:
-                    llm_calls_total.add(1, {"stage": stage, "outcome": "error"})
+                if _obs.llm_calls_total is not None:
+                    _obs.llm_calls_total.add(1, {"stage": stage, "outcome": "error"})
                 raise
 
         # Defensive: the loop above always returns or raises, but mypy needs
@@ -395,8 +390,8 @@ class OpenRouterLLMClient:
             prompt_tokens = 0
             completion_tokens = 0
             total_tokens = 0
-            if llm_usage_missing_total is not None:
-                llm_usage_missing_total.add(1, {"stage": stage})
+            if _obs.llm_usage_missing_total is not None:
+                _obs.llm_usage_missing_total.add(1, {"stage": stage})
         else:
             usage_missing = False
             prompt_tokens = raw_prompt
@@ -404,17 +399,17 @@ class OpenRouterLLMClient:
             total_tokens = raw_total
 
         # Token + call metrics.
-        if llm_tokens_total is not None:
-            llm_tokens_total.add(
+        if _obs.llm_tokens_total is not None:
+            _obs.llm_tokens_total.add(
                 prompt_tokens,
                 {"stage": stage, "kind": "prompt"},
             )
-            llm_tokens_total.add(
+            _obs.llm_tokens_total.add(
                 completion_tokens,
                 {"stage": stage, "kind": "completion"},
             )
-        if llm_calls_total is not None:
-            llm_calls_total.add(1, {"stage": stage, "outcome": "success"})
+        if _obs.llm_calls_total is not None:
+            _obs.llm_calls_total.add(1, {"stage": stage, "outcome": "success"})
 
         log_event(
             _logger,
@@ -520,8 +515,8 @@ class OpenRouterLLMClient:
         request_id: str | None,
     ) -> SQLGenerationResponse:
         """Extract a SELECT by case-insensitive search when JSON parsing fails."""
-        if llm_json_fallback_total is not None:
-            llm_json_fallback_total.add(1, {"stage": "sql_generation"})
+        if _obs.llm_json_fallback_total is not None:
+            _obs.llm_json_fallback_total.add(1, {"stage": "sql_generation"})
         _logger.warning(
             "llm_json_fallback",
             extra={
@@ -581,8 +576,8 @@ class OpenRouterLLMClient:
         if len(rows) == 1 and len(rows[0]) == 1:
             value = next(iter(rows[0].values()))
             answer = f"The answer is {_format_scalar(value)}."
-            if llm_short_circuit_total is not None:
-                llm_short_circuit_total.add(1, {"stage": "answer_generation"})
+            if _obs.llm_short_circuit_total is not None:
+                _obs.llm_short_circuit_total.add(1, {"stage": "answer_generation"})
             log_event(
                 _logger,
                 "llm_short_circuit",
@@ -632,8 +627,8 @@ class OpenRouterLLMClient:
         intermediate: list[dict[str, Any]] = []
         if suspicious:
             intermediate.append({"suspicious_numeric_claims": suspicious})
-            if answer_hallucinations_total is not None:
-                answer_hallucinations_total.add(1)
+            if _obs.answer_hallucinations_total is not None:
+                _obs.answer_hallucinations_total.add(1)
             log_event(
                 _logger,
                 "answer_fidelity_warning",

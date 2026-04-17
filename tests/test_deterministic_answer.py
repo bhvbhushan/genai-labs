@@ -10,7 +10,6 @@ BACKEND_ROOT = Path(__file__).resolve().parents[1]
 if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
 
-from src import llm_client as llm_client_mod  # noqa: E402
 from src.llm_client import OpenRouterLLMClient  # noqa: E402
 from src.schema import SchemaCatalog  # noqa: E402
 
@@ -130,9 +129,12 @@ class ShortCircuitMetricTests(unittest.TestCase):
     def test_short_circuit_counter_incremented_once(self) -> None:
         client = _make_client()
         counter = MagicMock()
-        # Patch the module-level instrument reference that generate_answer
-        # uses to increment; the real instrument may be None pre-configure.
-        with patch.object(llm_client_mod, "llm_short_circuit_total", counter):
+        # Patch the counter on the observability module — llm_client reads it
+        # via the module (``_obs.llm_short_circuit_total``) so module-level
+        # rebinds take effect.
+        from src import observability as obs_mod
+
+        with patch.object(obs_mod, "llm_short_circuit_total", counter):
             client.generate_answer(
                 "q",
                 "SELECT COUNT(*) FROM t",
@@ -145,7 +147,9 @@ class ShortCircuitMetricTests(unittest.TestCase):
     def test_short_circuit_noop_when_counter_none(self) -> None:
         # Guard path: instrument is None pre-configure; must not crash.
         client = _make_client()
-        with patch.object(llm_client_mod, "llm_short_circuit_total", None):
+        from src import observability as obs_mod
+
+        with patch.object(obs_mod, "llm_short_circuit_total", None):
             out = client.generate_answer(
                 "q",
                 "SELECT COUNT(*) FROM t",

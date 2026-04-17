@@ -30,6 +30,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from src import observability as _obs
 from src.config import Settings, get_settings
 from src.conversation import ConversationStore, Turn
 from src.followup import FollowupClassifier, FollowupResponse
@@ -40,11 +41,6 @@ from src.observability import (
     get_logger,
     get_tracer,
     log_event,
-    pipeline_requests_total,
-    response_cache_hits_total,
-    response_cache_misses_total,
-    result_validation_warnings_total,
-    stage_duration_ms,
 )
 from src.response_cache import ResponseCache
 from src.result_validator import ResultValidator
@@ -222,13 +218,13 @@ class AnalyticsPipeline:
                     request_id=rid,
                     question=question,
                 )
-                if response_cache_hits_total is not None:
-                    response_cache_hits_total.add(1)
-                if pipeline_requests_total is not None:
-                    pipeline_requests_total.add(1, {"status": "success", "cache": "hit"})
+                if _obs.response_cache_hits_total is not None:
+                    _obs.response_cache_hits_total.add(1)
+                if _obs.pipeline_requests_total is not None:
+                    _obs.pipeline_requests_total.add(1, {"status": "success", "cache": "hit"})
                 return cached
-            if response_cache_misses_total is not None:
-                response_cache_misses_total.add(1)
+            if _obs.response_cache_misses_total is not None:
+                _obs.response_cache_misses_total.add(1)
 
         # Multi-turn: classify + maybe rewrite against recent history. The
         # helper only returns a non-None classification when conversation_id
@@ -317,21 +313,21 @@ class AnalyticsPipeline:
             # Stage 1: SQL generation.
             with Timer("sql_generation"):
                 sql_gen = self._llm.generate_sql(effective_question, request_id=rid)
-            if stage_duration_ms is not None:
-                stage_duration_ms.record(sql_gen.timing_ms, {"stage": "sql_generation"})
+            if _obs.stage_duration_ms is not None:
+                _obs.stage_duration_ms.record(sql_gen.timing_ms, {"stage": "sql_generation"})
 
             # Stage 2: SQL validation.
             with Timer("sql_validation"):
                 sql_val = self._validator.validate(sql_gen.sql, request_id=rid)
-            if stage_duration_ms is not None:
-                stage_duration_ms.record(sql_val.timing_ms, {"stage": "sql_validation"})
+            if _obs.stage_duration_ms is not None:
+                _obs.stage_duration_ms.record(sql_val.timing_ms, {"stage": "sql_validation"})
 
             # Stage 3: Execution (only when validation passed).
             sql_for_exec = sql_val.validated_sql if sql_val.is_valid else None
             with Timer("sql_execution"):
                 sql_exec = self._executor.run(sql_for_exec)
-            if stage_duration_ms is not None:
-                stage_duration_ms.record(sql_exec.timing_ms, {"stage": "sql_execution"})
+            if _obs.stage_duration_ms is not None:
+                _obs.stage_duration_ms.record(sql_exec.timing_ms, {"stage": "sql_execution"})
 
             # Result validation: non-fatal plausibility checks on returned
             # rows. Emits structured warnings + counter increments but never
@@ -348,8 +344,8 @@ class AnalyticsPipeline:
                     column=w.column,
                     detail=w.detail,
                 )
-                if result_validation_warnings_total is not None:
-                    result_validation_warnings_total.add(1, {"kind": w.kind})
+                if _obs.result_validation_warnings_total is not None:
+                    _obs.result_validation_warnings_total.add(1, {"kind": w.kind})
 
             # Stage 4: Answer generation.
             with Timer("answer_generation"):
@@ -359,8 +355,8 @@ class AnalyticsPipeline:
                     sql_exec.rows,
                     request_id=rid,
                 )
-            if stage_duration_ms is not None:
-                stage_duration_ms.record(ans.timing_ms, {"stage": "answer_generation"})
+            if _obs.stage_duration_ms is not None:
+                _obs.stage_duration_ms.record(ans.timing_ms, {"stage": "answer_generation"})
 
         status = _derive_status(sql_gen, sql_val, sql_exec)
 
@@ -375,8 +371,8 @@ class AnalyticsPipeline:
 
         total_llm_stats = _aggregate_llm_stats(sql_gen.llm_stats, ans.llm_stats)
 
-        if pipeline_requests_total is not None:
-            pipeline_requests_total.add(1, {"status": status})
+        if _obs.pipeline_requests_total is not None:
+            _obs.pipeline_requests_total.add(1, {"status": status})
 
         log_event(
             _logger,
@@ -436,8 +432,8 @@ class AnalyticsPipeline:
                     prior_rows,
                     request_id=rid,
                 )
-            if stage_duration_ms is not None:
-                stage_duration_ms.record(ans.timing_ms, {"stage": "answer_generation"})
+            if _obs.stage_duration_ms is not None:
+                _obs.stage_duration_ms.record(ans.timing_ms, {"stage": "answer_generation"})
 
         total_ms = (time.perf_counter() - pipeline_start) * 1000.0
 
@@ -482,8 +478,8 @@ class AnalyticsPipeline:
             ans.llm_stats,
         )
 
-        if pipeline_requests_total is not None:
-            pipeline_requests_total.add(1, {"status": status})
+        if _obs.pipeline_requests_total is not None:
+            _obs.pipeline_requests_total.add(1, {"status": status})
 
         log_event(
             _logger,

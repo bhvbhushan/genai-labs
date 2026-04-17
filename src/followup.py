@@ -26,10 +26,10 @@ from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, ConfigDict, ValidationError
 
+from src import observability as _obs
 from src.conversation import FollowupIntent, Turn, summarize_rows
 from src.observability import (
     get_logger,
-    llm_json_fallback_total,
     log_event,
 )
 
@@ -205,8 +205,8 @@ class FollowupClassifier:
         reason: str,
     ) -> FollowupResponse:
         """Bump the shared JSON-fallback counter, warn, and return NEW_QUERY."""
-        if llm_json_fallback_total is not None:
-            llm_json_fallback_total.add(1, {"stage": "followup_classification"})
+        if _obs.llm_json_fallback_total is not None:
+            _obs.llm_json_fallback_total.add(1, {"stage": "followup_classification"})
         _logger.warning(
             "llm_json_fallback",
             extra={
