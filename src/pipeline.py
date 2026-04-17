@@ -230,15 +230,16 @@ class AnalyticsPipeline:
             if response_cache_misses_total is not None:
                 response_cache_misses_total.add(1)
 
-        # Multi-turn: classify + maybe rewrite against recent history.
+        # Multi-turn: classify + maybe rewrite against recent history. The
+        # helper only returns a non-None classification when conversation_id
+        # is a live id with history — but pyright can't see that cross-arg
+        # dependency, so we still gate the REINTERPRET branch on the id
+        # explicitly (which also narrows conversation_id to str).
         effective_question = question
         followup: FollowupResponse | None = None
-        if conversation_id and conversation_id in self._conversation_store:
-            history = self._conversation_store.last_turns(conversation_id, _FOLLOWUP_HISTORY_WINDOW)
-            if history:
-                followup = self._followup_classifier.classify_and_rewrite(
-                    question, history, request_id=rid
-                )
+        if conversation_id is not None:
+            followup, history = self._classify_followup_or_none(conversation_id, question, rid)
+            if followup is not None:
                 log_event(
                     _logger,
                     "followup_classified",
@@ -256,7 +257,7 @@ class AnalyticsPipeline:
 
         output = self._run_pipeline(effective_question, question, rid)
 
-        if conversation_id:
+        if conversation_id is not None:
             self._record_turn(conversation_id, question, followup, output)
         elif output.status == "success":
             # Cache only successful single-turn results. Errors / unanswerables
@@ -264,6 +265,34 @@ class AnalyticsPipeline:
             self._response_cache.put(question, output)
 
         return output
+
+    # ------------------------------------------------------------------
+    # Internal: multi-turn followup classification
+    # ------------------------------------------------------------------
+
+    def _classify_followup_or_none(
+        self,
+        conversation_id: str,
+        question: str,
+        rid: str,
+    ) -> tuple[FollowupResponse | None, list[Turn]]:
+        """Classify ``question`` against recent history, or return ``(None, [])``.
+
+        Returns ``(None, [])`` when ``conversation_id`` has no stored history
+        or the stored history is empty. Returns the classifier's full
+        ``FollowupResponse`` + fetched history otherwise. Pulling this out
+        lets ``run()`` use a single ``if followup is not None:`` guard so
+        pyright can narrow cleanly across the downstream intent checks.
+        """
+        if conversation_id not in self._conversation_store:
+            return None, []
+        history = self._conversation_store.last_turns(conversation_id, _FOLLOWUP_HISTORY_WINDOW)
+        if not history:
+            return None, []
+        classification = self._followup_classifier.classify_and_rewrite(
+            question, history, request_id=rid
+        )
+        return classification, history
 
     # ------------------------------------------------------------------
     # Internal: standard pipeline (Lane D flow preserved byte-for-byte)
