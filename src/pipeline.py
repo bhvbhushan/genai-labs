@@ -43,9 +43,11 @@ from src.observability import (
     pipeline_requests_total,
     response_cache_hits_total,
     response_cache_misses_total,
+    result_validation_warnings_total,
     stage_duration_ms,
 )
 from src.response_cache import ResponseCache
+from src.result_validator import ResultValidator
 from src.schema import SchemaCatalog
 from src.types import (
     AnswerGenerationOutput,
@@ -137,6 +139,7 @@ class AnalyticsPipeline:
         conversation_store: ConversationStore | None = None,
         followup_classifier: FollowupClassifier | None = None,
         response_cache: ResponseCache | None = None,
+        result_validator: ResultValidator | None = None,
     ) -> None:
         configure_observability()
         self._settings = settings or get_settings()
@@ -174,6 +177,9 @@ class AnalyticsPipeline:
             else FollowupClassifier(self._llm)
         )
         self._response_cache = response_cache if response_cache is not None else ResponseCache()
+        self._result_validator = (
+            result_validator if result_validator is not None else ResultValidator(self._schema)
+        )
         log_event(
             _logger,
             "pipeline_initialized",
@@ -297,6 +303,24 @@ class AnalyticsPipeline:
                 sql_exec = self._executor.run(sql_for_exec)
             if stage_duration_ms is not None:
                 stage_duration_ms.record(sql_exec.timing_ms, {"stage": "sql_execution"})
+
+            # Result validation: non-fatal plausibility checks on returned
+            # rows. Emits structured warnings + counter increments but never
+            # fails the pipeline — a surprising result is still a valid
+            # result to surface.
+            result_warnings = self._result_validator.validate(sql_exec.rows, sql_for_exec)
+            for w in result_warnings:
+                log_event(
+                    _logger,
+                    "result_validation_warning",
+                    request_id=rid,
+                    stage="sql_execution",
+                    kind=w.kind,
+                    column=w.column,
+                    detail=w.detail,
+                )
+                if result_validation_warnings_total is not None:
+                    result_validation_warnings_total.add(1, {"kind": w.kind})
 
             # Stage 4: Answer generation.
             with Timer("answer_generation"):

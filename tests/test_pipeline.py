@@ -22,7 +22,8 @@ from src.pipeline import (  # noqa: E402
     _derive_status,
 )
 from src.response_cache import ResponseCache  # noqa: E402
-from src.schema import SchemaCatalog  # noqa: E402
+from src.result_validator import ResultValidator  # noqa: E402
+from src.schema import ColumnInfo, SchemaCatalog  # noqa: E402
 from src.types import (  # noqa: E402
     AnswerGenerationOutput,
     SQLExecutionOutput,
@@ -577,6 +578,81 @@ class ResponseCacheIntegrationTests(unittest.TestCase):
         # Second call re-runs the pipeline.
         pipe.run("bad q")
         self.assertEqual(llm_mock.generate_sql.call_count, 2)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Result validator integration
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _schema_with_age_range() -> SchemaCatalog:
+    return SchemaCatalog(
+        table="t",
+        columns=(
+            ColumnInfo(
+                name="age",
+                sql_type="INTEGER",
+                kind="numeric",
+                min_value=13.0,
+                max_value=59.0,
+            ),
+        ),
+    )
+
+
+class ResultValidatorIntegrationTests(unittest.TestCase):
+    def test_warnings_are_logged_but_status_still_success(self) -> None:
+        schema = _schema_with_age_range()
+        llm = MagicMock()
+        llm.model_name = "test-model"
+        llm.generate_sql.return_value = _make_gen(sql="SELECT age FROM t WHERE 1=1")
+        llm.generate_answer.return_value = _make_ans()
+        validator = MagicMock()
+        validator.validate.return_value = _make_val(validated_sql="SELECT age FROM t WHERE 1=1")
+        executor = MagicMock()
+        # Age 200 is outside the declared max 59.
+        executor.run.return_value = _make_exec(rows=[{"age": 200}])
+
+        pipe = AnalyticsPipeline(
+            schema=schema,
+            llm_client=llm,
+            validator=validator,
+            executor=executor,
+            result_validator=ResultValidator(schema),
+        )
+        with self.assertLogs("src.pipeline", level="INFO") as captured:
+            result = pipe.run("out of range query")
+
+        # Pipeline still returned success — warnings are non-fatal.
+        self.assertEqual(result.status, "success")
+        # And the warning landed in the logs.
+        messages = [r.getMessage() for r in captured.records]
+        self.assertIn("result_validation_warning", messages)
+
+    def test_no_warnings_when_rows_in_range(self) -> None:
+        schema = _schema_with_age_range()
+        llm = MagicMock()
+        llm.model_name = "test-model"
+        llm.generate_sql.return_value = _make_gen(sql="SELECT age FROM t WHERE 1=1")
+        llm.generate_answer.return_value = _make_ans()
+        validator = MagicMock()
+        validator.validate.return_value = _make_val(validated_sql="SELECT age FROM t WHERE 1=1")
+        executor = MagicMock()
+        executor.run.return_value = _make_exec(rows=[{"age": 25}])
+
+        pipe = AnalyticsPipeline(
+            schema=schema,
+            llm_client=llm,
+            validator=validator,
+            executor=executor,
+            result_validator=ResultValidator(schema),
+        )
+        with self.assertLogs("src.pipeline", level="INFO") as captured:
+            result = pipe.run("in-range query")
+
+        self.assertEqual(result.status, "success")
+        messages = [r.getMessage() for r in captured.records]
+        self.assertNotIn("result_validation_warning", messages)
 
 
 # Silence the root logger's JsonFormatter noise during mocked tests so
