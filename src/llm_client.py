@@ -241,11 +241,8 @@ class OpenRouterLLMClient:
                 if attempt < attempts - 1:
                     if llm_calls_total is not None:
                         llm_calls_total.add(1, {"stage": stage, "outcome": "retry"})
-                    # Jittered exponential-ish backoff: base * U(0.7, 1.3),
-                    # doubled on the second retry if retries > 1.
+                    # Jittered constant backoff per plan: base * U(0.7, 1.3).
                     delay = self._retry_base_s * random.uniform(0.7, 1.3)
-                    if attempt >= 1:
-                        delay *= 2.0
                     time.sleep(delay)
                     continue
                 # No retries left.

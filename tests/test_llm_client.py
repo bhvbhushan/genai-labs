@@ -211,7 +211,9 @@ class GenerateSQLTests(unittest.TestCase):
         client._client.chat.send = MagicMock(  # type: ignore[method-assign]
             side_effect=[ConnectionError("timeout"), ok_response],
         )
-        out = client.generate_sql("retry me")
+        # Pin the jitter source so the test is deterministic.
+        with patch("src.llm_client.random.uniform", return_value=1.0):
+            out = client.generate_sql("retry me")
         self.assertEqual(out.sql, "SELECT 1")
         self.assertIsNone(out.error)
         # send was called twice: one failure + one success.
