@@ -95,6 +95,17 @@ module = "tests.*"
 disallow_untyped_defs = false
 
 # ────────────────────────────────────────────────────────────────────────────
+# Pyright — IDE/LSP type checker (VS Code default)
+# Points at .venv so the editor resolves installed packages.
+# ────────────────────────────────────────────────────────────────────────────
+[tool.pyright]
+venvPath = "."
+venv = ".venv"
+pythonVersion = "3.13"
+include = ["src", "tests", "scripts"]
+exclude = ["**/node_modules", "**/__pycache__", "**/.*", ".venv", "data"]
+
+# ────────────────────────────────────────────────────────────────────────────
 # Coverage (optional future use)
 # ────────────────────────────────────────────────────────────────────────────
 [tool.coverage.run]
