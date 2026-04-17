@@ -49,7 +49,7 @@ class SQLValidator:
         self._allowed_table: str = schema.table.lower()
         self._row_limit: int = row_limit
 
-    def validate(self, sql: str | None) -> SQLValidationOutput:
+    def validate(self, sql: str | None, *, request_id: str | None = None) -> SQLValidationOutput:
         """Return a ``SQLValidationOutput``; never raises on bad input."""
         start = time.perf_counter()
         result = self._validate_inner(sql)
@@ -58,6 +58,7 @@ class SQLValidator:
             log_event(
                 _logger,
                 "sql_rejected",
+                request_id=request_id,
                 stage="validation",
                 duration_ms=result.timing_ms,
                 error=result.error,
@@ -114,12 +115,22 @@ class SQLValidator:
                 )
 
         # 6. Every referenced table must match the allowlist (excluding
-        # CTE-defined names, which are synthetic aliases).
+        # CTE-defined names, which are synthetic aliases). Qualified
+        # references (``db.t`` / ``catalog.db.t``) are rejected explicitly
+        # because ``table.name`` only returns the last component; without
+        # this guard ``SELECT * FROM other_db.t`` would pass the allowlist
+        # check for the single allowed table ``"t"``.
         cte_names: set[str] = {c.alias_or_name.lower() for c in stmt.find_all(exp.CTE)}
         for table in stmt.find_all(exp.Table):
             tname = table.name.lower()
             if tname in cte_names:
                 continue
+            if table.args.get("db") or table.args.get("catalog"):
+                return SQLValidationOutput(
+                    is_valid=False,
+                    validated_sql=None,
+                    error=f"Qualified table references not allowed: {table.sql()}",
+                )
             if tname != self._allowed_table:
                 return SQLValidationOutput(
                     is_valid=False,

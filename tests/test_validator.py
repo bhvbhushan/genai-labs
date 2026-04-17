@@ -109,24 +109,24 @@ class SQLValidatorTests(unittest.TestCase):
         self.assertFalse(out.is_valid)
         self.assertEqual(out.error, "Multiple statements not allowed")
 
-    # 14. Line-comment smuggling: the validated (round-tripped) output
-    # must not contain the raw line-comment marker.
+    # 14. Line-comment smuggling: validation must succeed (the trailing
+    # ``-- DROP TABLE t`` is a comment, not a second statement) and the
+    # round-tripped output must be fully stripped of comment syntax.
     def test_line_comment_smuggling_stripped(self) -> None:
         out = _make_validator().validate("SELECT * FROM t -- DROP TABLE t")
-        # Either rejected, or the round-tripped SQL has no -- artifact.
-        if out.is_valid:
-            assert out.validated_sql is not None
-            self.assertNotIn("--", out.validated_sql)
-            self.assertNotIn("DROP", out.validated_sql.upper())
-        else:
-            self.assertIsNotNone(out.error)
+        self.assertTrue(out.is_valid, msg=out.error)
+        assert out.validated_sql is not None
+        self.assertNotIn("--", out.validated_sql)
+        self.assertNotIn("DROP", out.validated_sql.upper())
 
-    # 15. Block-comment smuggling: validated output has no /*.
+    # 15. Block-comment smuggling: validation must succeed and the
+    # round-tripped output must contain no block-comment syntax or payload.
     def test_block_comment_smuggling_stripped(self) -> None:
         out = _make_validator().validate("SELECT * /* hack */ FROM t")
         self.assertTrue(out.is_valid, msg=out.error)
         assert out.validated_sql is not None
         self.assertNotIn("/*", out.validated_sql)
+        self.assertNotIn("*/", out.validated_sql)
         self.assertNotIn("hack", out.validated_sql)
 
     # 16. Unknown table rejected with "Unknown table".
@@ -191,6 +191,47 @@ class SQLValidatorTests(unittest.TestCase):
     def test_table_match_case_insensitive(self) -> None:
         out = _make_validator().validate("SELECT * FROM T")
         self.assertTrue(out.is_valid, msg=out.error)
+
+    # 24. UNION of two SELECTs against the allowed table passes and auto-LIMIT
+    # is still injected on the top-level statement.
+    def test_union_allowed_and_limit_injected(self) -> None:
+        out = _make_validator().validate(
+            "SELECT x FROM t WHERE x > 1 UNION SELECT x FROM t WHERE x < 0"
+        )
+        self.assertTrue(out.is_valid, msg=out.error)
+        assert out.validated_sql is not None
+        self.assertIn("UNION", out.validated_sql.upper())
+        self.assertIn("LIMIT 1000", out.validated_sql.upper())
+
+    # 25. CTE whose alias shadows the real table — the CTE body doesn't
+    # reference any other table, so this must be accepted.
+    def test_cte_shadowing_allowed_table_is_accepted(self) -> None:
+        out = _make_validator().validate("WITH t AS (SELECT 1 AS x) SELECT * FROM t")
+        self.assertTrue(out.is_valid, msg=out.error)
+
+    # 26. CTE body references an unknown table — even though the outer
+    # SELECT hits the CTE alias, the inner reference must be rejected.
+    def test_cte_body_references_unknown_table_is_rejected(self) -> None:
+        out = _make_validator().validate("WITH cte AS (SELECT x FROM evil) SELECT * FROM cte")
+        self.assertFalse(out.is_valid)
+        assert out.error is not None
+        self.assertIn("evil", out.error)
+
+    # 27. Non-positive ``row_limit`` must raise at construction time.
+    def test_row_limit_must_be_positive(self) -> None:
+        schema = SchemaCatalog(table="t", columns=())
+        with self.assertRaises(ValueError):
+            SQLValidator(schema, row_limit=0)
+        with self.assertRaises(ValueError):
+            SQLValidator(schema, row_limit=-5)
+
+    # 28. Qualified references like ``other_db.t`` bypass the allowlist when
+    # only ``table.name`` (last component) is compared. Must be rejected.
+    def test_qualified_table_reference_rejected(self) -> None:
+        out = _make_validator().validate("SELECT * FROM other_db.t")
+        self.assertFalse(out.is_valid)
+        assert out.error is not None
+        self.assertIn("Qualified", out.error)
 
 
 if __name__ == "__main__":
