@@ -66,7 +66,7 @@ def create_table_from_df(
             raise ValueError(
                 f"Table '{table_name}' already exists. Use --if-exists replace or append."
             )
-        elif if_exists == "append":
+        if if_exists == "append":
             return
 
     # 3. Build Column Definitions
@@ -145,12 +145,12 @@ def verify_database(db_path: Path, table_name: str):
     cursor.execute(f'PRAGMA table_info("{table_name}")')
     columns = cursor.fetchall()
 
-    print(f"\n--- Database Verification ---")
+    print("\n--- Database Verification ---")
     print(f"Table: {table_name}")
     print(f"Total rows: {total_rows:,}")
     print(f"Columns ({len(columns)}):")
     for col in columns:
-        cid, name, dtype, notnull, dflt_value, pk = col
+        _, name, dtype, *_ = col
         print(f"  - {name} ({dtype})")
 
     # Gender distribution
@@ -162,7 +162,7 @@ def verify_database(db_path: Path, table_name: str):
             ORDER BY count DESC
         ''')
         distribution = cursor.fetchall()
-        print(f"\nGender Distribution:")
+        print("\nGender Distribution:")
         for gender, group_count in distribution:
             percentage = (group_count / total_rows) * 100 if total_rows > 0 else 0
             print(f"  {gender}: {group_count:,} ({percentage:.1f}%)")
@@ -184,7 +184,7 @@ def verify_database(db_path: Path, table_name: str):
             ORDER BY MIN(addiction_level)
         ''')
         distribution = cursor.fetchall()
-        print(f"\nAddiction Level Distribution:")
+        print("\nAddiction Level Distribution:")
         for bucket, group_count in distribution:
             percentage = (group_count / total_rows) * 100 if total_rows > 0 else 0
             print(f"  {bucket}: {group_count:,} ({percentage:.1f}%)")
@@ -249,7 +249,7 @@ def main():
             verify_database(args.db, args.table)
 
         print("\n✓ Conversion completed successfully!")
-        print(f"\nYou can now use this database with the LLM agent.")
+        print("\nYou can now use this database with the LLM agent.")
         print(f"Table name: '{args.table}'")
         print(f"Database path: {args.db}")
 
@@ -265,6 +265,7 @@ def main():
     except Exception as e:
         print(f"Unexpected error: {e}")
         import traceback
+
         traceback.print_exc()
         return 1
 
