@@ -281,20 +281,18 @@ class OpenRouterLLMClient:
         raw_prompt = _safe_int(getattr(usage, "prompt_tokens", None))
         raw_completion = _safe_int(getattr(usage, "completion_tokens", None))
         raw_total = _safe_int(getattr(usage, "total_tokens", None))
-        usage_missing = (
-            usage is None or raw_prompt is None or raw_completion is None or raw_total is None
-        )
-        if usage_missing:
+        prompt_tokens: int
+        completion_tokens: int
+        total_tokens: int
+        if usage is None or raw_prompt is None or raw_completion is None or raw_total is None:
+            usage_missing = True
             prompt_tokens = 0
             completion_tokens = 0
             total_tokens = 0
             if llm_usage_missing_total is not None:
                 llm_usage_missing_total.add(1, {"stage": stage})
         else:
-            # Narrow: the guard above proved none of these are None.
-            assert raw_prompt is not None
-            assert raw_completion is not None
-            assert raw_total is not None
+            usage_missing = False
             prompt_tokens = raw_prompt
             completion_tokens = raw_completion
             total_tokens = raw_total

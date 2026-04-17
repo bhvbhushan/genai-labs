@@ -139,9 +139,8 @@ class ShortCircuitMetricTests(unittest.TestCase):
                 [{"n": 7}],
             )
         counter.add.assert_called_once()
-        args, _kwargs = counter.add.call_args
-        # First positional is the increment value.
-        self.assertEqual(args[0], 1)
+        # First positional arg is the increment value.
+        self.assertEqual(counter.add.call_args.args[0], 1)
 
     def test_short_circuit_noop_when_counter_none(self) -> None:
         # Guard path: instrument is None pre-configure; must not crash.
