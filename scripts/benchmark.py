@@ -5,6 +5,7 @@ import json
 import os
 import statistics
 import sys
+from collections import Counter
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -36,14 +37,20 @@ def percentile(values: list[float], p: float) -> float:
     if not values:
         return 0.0
     sorted_vals = sorted(values)
-    idx = min(len(sorted_vals) - 1, max(0, int(round((p / 100.0) * (len(sorted_vals) - 1)))))
+    idx = min(len(sorted_vals) - 1, max(0, round((p / 100.0) * (len(sorted_vals) - 1))))
     return sorted_vals[idx]
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--runs", type=int, default=3, help="Number of full prompt-set repetitions.")
+    parser.add_argument(
+        "--runs", type=int, default=3, help="Number of full prompt-set repetitions."
+    )
     args = parser.parse_args()
+
+    # Benchmark stays quiet by default so stdout is a clean JSON blob.
+    os.environ.setdefault("OTEL_METRICS_EXPORTER", "none")
+    os.environ.setdefault("OTEL_TRACES_EXPORTER", "none")
 
     db_path = _ensure_gaming_db()
     root = Path(__file__).resolve().parents[1]
@@ -53,6 +60,9 @@ def main() -> None:
     prompts = json.loads(prompts_path.read_text(encoding="utf-8"))
 
     totals: list[float] = []
+    total_tokens: list[float] = []
+    llm_calls: list[float] = []
+    status_counter: Counter[str] = Counter()
     success = 0
     count = 0
 
@@ -60,6 +70,10 @@ def main() -> None:
         for prompt in prompts:
             result = pipeline.run(prompt)
             totals.append(result.timings["total_ms"])
+            stats = result.total_llm_stats or {}
+            total_tokens.append(float(stats.get("total_tokens", 0) or 0))
+            llm_calls.append(float(stats.get("llm_calls", 0) or 0))
+            status_counter[result.status] += 1
             success += int(result.status == "success")
             count += 1
 
@@ -70,6 +84,11 @@ def main() -> None:
         "avg_ms": round(statistics.fmean(totals), 2) if totals else 0.0,
         "p50_ms": round(percentile(totals, 50), 2),
         "p95_ms": round(percentile(totals, 95), 2),
+        "avg_total_tokens": round(statistics.fmean(total_tokens), 2) if total_tokens else 0.0,
+        "p50_total_tokens": round(percentile(total_tokens, 50), 2),
+        "p95_total_tokens": round(percentile(total_tokens, 95), 2),
+        "avg_llm_calls": round(statistics.fmean(llm_calls), 4) if llm_calls else 0.0,
+        "status_breakdown": dict(status_counter),
     }
     print(json.dumps(summary, indent=2))
 
