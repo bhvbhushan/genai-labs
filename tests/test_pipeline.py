@@ -13,6 +13,8 @@ BACKEND_ROOT = Path(__file__).resolve().parents[1]
 if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
 
+from src.conversation import ConversationStore, Turn  # noqa: E402
+from src.followup import FollowupResponse  # noqa: E402
 from src.pipeline import (  # noqa: E402
     AnalyticsPipeline,
     SQLiteExecutor,
@@ -101,9 +103,12 @@ def _make_pipeline(
     val: SQLValidationOutput | None = None,
     exec_: SQLExecutionOutput | None = None,
     ans: AnswerGenerationOutput | None = None,
+    conversation_store: ConversationStore | None = None,
+    followup_classifier: Any = None,
 ) -> AnalyticsPipeline:
     """Build an AnalyticsPipeline with fully mocked components (no I/O)."""
     llm = MagicMock()
+    llm.model_name = "test-model"
     llm.generate_sql.return_value = gen or _make_gen()
     llm.generate_answer.return_value = ans or _make_ans()
 
@@ -119,6 +124,8 @@ def _make_pipeline(
         llm_client=llm,
         validator=validator,
         executor=executor,
+        conversation_store=conversation_store,
+        followup_classifier=followup_classifier,
     )
 
 
@@ -324,6 +331,173 @@ class AnalyticsPipelineTests(unittest.TestCase):
         # uuid4().hex[:16] → 16 hex chars.
         assert result.request_id is not None
         self.assertEqual(len(result.request_id), 16)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Multi-turn: conversation_id + followup classifier integration
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class MultiTurnTests(unittest.TestCase):
+    def test_no_conversation_id_skips_classifier_and_store(self) -> None:
+        store = ConversationStore()
+        classifier = MagicMock()
+        pipe = _make_pipeline(
+            conversation_store=store,
+            followup_classifier=classifier,
+        )
+        result = pipe.run("q")
+        self.assertEqual(result.status, "success")
+        self.assertFalse(classifier.classify_and_rewrite.called)
+        self.assertEqual(len(store), 0)
+
+    def test_first_turn_with_conversation_id_skips_classifier_and_appends(self) -> None:
+        store = ConversationStore()
+        classifier = MagicMock()
+        pipe = _make_pipeline(
+            conversation_store=store,
+            followup_classifier=classifier,
+        )
+        result = pipe.run("q1", conversation_id="c1")
+        self.assertEqual(result.status, "success")
+        # Empty history → classifier never invoked.
+        self.assertFalse(classifier.classify_and_rewrite.called)
+        self.assertIn("c1", store)
+        history = store.get_history("c1")
+        self.assertEqual(len(history), 1)
+        self.assertEqual(history[0].question, "q1")
+        self.assertEqual(history[0].intent, "NEW_QUERY")
+
+    def test_second_turn_invokes_classifier_with_history(self) -> None:
+        store = ConversationStore()
+        classifier = MagicMock()
+        classifier.classify_and_rewrite.return_value = FollowupResponse(
+            intent="NEW_QUERY",
+            rewritten_question="q2",
+            reuses_prior_rows=False,
+        )
+        pipe = _make_pipeline(
+            conversation_store=store,
+            followup_classifier=classifier,
+        )
+        pipe.run("q1", conversation_id="c1")
+        pipe.run("q2", conversation_id="c1")
+
+        self.assertTrue(classifier.classify_and_rewrite.called)
+        call_args = classifier.classify_and_rewrite.call_args
+        self.assertEqual(call_args.args[0], "q2")
+        history_passed: list[Turn] = call_args.args[1]
+        self.assertEqual(len(history_passed), 1)
+        self.assertEqual(history_passed[0].question, "q1")
+        # Two turns stored.
+        self.assertEqual(len(store.get_history("c1")), 2)
+
+    def test_followup_new_sql_uses_rewritten_question(self) -> None:
+        store = ConversationStore()
+        classifier = MagicMock()
+        classifier.classify_and_rewrite.return_value = FollowupResponse(
+            intent="FOLLOWUP_NEW_SQL",
+            rewritten_question="addiction level distribution for males",
+            reuses_prior_rows=False,
+        )
+        pipe = _make_pipeline(
+            conversation_store=store,
+            followup_classifier=classifier,
+        )
+        # Seed with prior turn so history is non-empty.
+        pipe.run("addiction by gender", conversation_id="c1")
+
+        llm_mock = pipe._llm  # type: ignore[attr-defined]
+        llm_mock.generate_sql.reset_mock()
+        llm_mock.generate_answer.reset_mock()
+
+        result = pipe.run("what about males?", conversation_id="c1")
+        self.assertEqual(result.status, "success")
+        # generate_sql was called with the rewritten question.
+        args = llm_mock.generate_sql.call_args
+        self.assertEqual(args.args[0], "addiction level distribution for males")
+        # Stored turn preserves the RAW user question + rewritten.
+        history = store.get_history("c1")
+        self.assertEqual(history[-1].question, "what about males?")
+        self.assertEqual(
+            history[-1].rewritten_question,
+            "addiction level distribution for males",
+        )
+        self.assertEqual(history[-1].intent, "FOLLOWUP_NEW_SQL")
+
+    def test_reinterpret_skips_sql_and_reuses_prior_rows(self) -> None:
+        store = ConversationStore()
+        classifier = MagicMock()
+        classifier.classify_and_rewrite.return_value = FollowupResponse(
+            intent="FOLLOWUP_REINTERPRET",
+            rewritten_question="which row is the highest?",
+            reuses_prior_rows=True,
+        )
+        prior_exec = _make_exec(rows=[{"v": 1}, {"v": 9}, {"v": 4}])
+        pipe = _make_pipeline(
+            conversation_store=store,
+            followup_classifier=classifier,
+            exec_=prior_exec,
+        )
+        pipe.run("show values", conversation_id="c1")
+
+        llm_mock = pipe._llm  # type: ignore[attr-defined]
+        llm_mock.generate_sql.reset_mock()
+        llm_mock.generate_answer.reset_mock()
+        # Configure answer for the reinterpret call.
+        llm_mock.generate_answer.return_value = _make_ans(answer="The highest is 9.")
+
+        result = pipe.run("which is highest?", conversation_id="c1")
+
+        self.assertEqual(result.status, "success")
+        self.assertFalse(llm_mock.generate_sql.called)
+        self.assertTrue(llm_mock.generate_answer.called)
+        ga_args = llm_mock.generate_answer.call_args
+        # Prior SQL + rows were forwarded.
+        self.assertEqual(ga_args.args[0], "which is highest?")
+        self.assertEqual(ga_args.args[1], "SELECT 1 LIMIT 1000")
+        self.assertEqual(ga_args.args[2], [{"v": 1}, {"v": 9}, {"v": 4}])
+        self.assertEqual(result.rows, [{"v": 1}, {"v": 9}, {"v": 4}])
+        self.assertEqual(result.answer, "The highest is 9.")
+        # All five timings present; skipped stages are zero.
+        for key in (
+            "sql_generation_ms",
+            "sql_validation_ms",
+            "sql_execution_ms",
+            "answer_generation_ms",
+            "total_ms",
+        ):
+            self.assertIn(key, result.timings)
+        self.assertEqual(result.timings["sql_generation_ms"], 0.0)
+        self.assertEqual(result.timings["sql_validation_ms"], 0.0)
+        self.assertEqual(result.timings["sql_execution_ms"], 0.0)
+
+    def test_new_query_intent_preserves_original_question(self) -> None:
+        store = ConversationStore()
+        classifier = MagicMock()
+        classifier.classify_and_rewrite.return_value = FollowupResponse(
+            intent="NEW_QUERY",
+            rewritten_question="unrelated",
+            reuses_prior_rows=False,
+        )
+        pipe = _make_pipeline(
+            conversation_store=store,
+            followup_classifier=classifier,
+        )
+        pipe.run("q1", conversation_id="c1")
+
+        llm_mock = pipe._llm  # type: ignore[attr-defined]
+        llm_mock.generate_sql.reset_mock()
+
+        pipe.run("completely different question", conversation_id="c1")
+        # NEW_QUERY does NOT rewrite: generate_sql sees the original.
+        args = llm_mock.generate_sql.call_args
+        self.assertEqual(args.args[0], "completely different question")
+
+        history = store.get_history("c1")
+        self.assertEqual(history[-1].intent, "NEW_QUERY")
+        # NEW_QUERY stores no rewritten_question.
+        self.assertIsNone(history[-1].rewritten_question)
 
 
 # Silence the root logger's JsonFormatter noise during mocked tests so
