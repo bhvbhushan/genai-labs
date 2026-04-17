@@ -2,9 +2,9 @@
 
 from functools import lru_cache
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
-from pydantic import AliasChoices, Field
+from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 BASE_DIR = Path(__file__).resolve().parents[1]
@@ -57,6 +57,26 @@ class Settings(BaseSettings):
         default=None,
         validation_alias=AliasChoices("OTEL_EXPORTER_OTLP_ENDPOINT", "otlp_endpoint"),
     )
+
+    # OTel exporter selection — standard env var names. "none" disables the
+    # exporter so instruments still register but no reader/processor is attached
+    # (keeps benchmark/test stderr quiet). "otlp" requires otlp_endpoint.
+    metrics_exporter: Literal["console", "otlp", "none"] = Field(
+        default="console",
+        validation_alias=AliasChoices("OTEL_METRICS_EXPORTER", "metrics_exporter"),
+    )
+    traces_exporter: Literal["console", "otlp", "none"] = Field(
+        default="console",
+        validation_alias=AliasChoices("OTEL_TRACES_EXPORTER", "traces_exporter"),
+    )
+
+    @field_validator("metrics_exporter", "traces_exporter", mode="before")
+    @classmethod
+    def _lower_exporter(cls, v: Any) -> Any:
+        """Normalize exporter selector to lowercase so env values like 'NONE' work."""
+        if isinstance(v, str):
+            return v.lower()
+        return v
 
 
 @lru_cache(maxsize=1)

@@ -4,6 +4,7 @@ import io
 import json
 import logging
 import os
+import re
 import sys
 import time
 import unittest
@@ -15,20 +16,40 @@ BACKEND_ROOT = Path(__file__).resolve().parents[1]
 if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
 
+from opentelemetry.exporter.otlp.proto.http.metric_exporter import (  # noqa: E402
+    OTLPMetricExporter,
+)
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import (  # noqa: E402
+    OTLPSpanExporter,
+)
 from src import observability  # noqa: E402
 from src.config import Settings, get_settings  # noqa: E402
 from src.observability import (  # noqa: E402
     JsonFormatter,
     Timer,
+    _build_metric_exporter,
+    _build_span_exporter,
     _reset_for_testing,
     configure_observability,
     get_logger,
+    get_tracer,
     log_event,
 )
 
 
-def _build_test_settings(otlp_endpoint: str | None = None) -> Settings:
-    env = {"OPENROUTER_API_KEY": "sk-test"}
+def _build_test_settings(
+    otlp_endpoint: str | None = None,
+    *,
+    log_format: str = "json",
+    metrics_exporter: str = "console",
+    traces_exporter: str = "console",
+) -> Settings:
+    env = {
+        "OPENROUTER_API_KEY": "sk-test",
+        "PIPELINE_LOG_FORMAT": log_format,
+        "OTEL_METRICS_EXPORTER": metrics_exporter,
+        "OTEL_TRACES_EXPORTER": traces_exporter,
+    }
     if otlp_endpoint is not None:
         env["OTEL_EXPORTER_OTLP_ENDPOINT"] = otlp_endpoint
     with patch.dict(os.environ, env, clear=True):
@@ -279,6 +300,154 @@ class LogEventTests(unittest.TestCase):
         self.assertEqual(payload["duration_ms"], 7.25)
         self.assertEqual(payload["status"], "success")
         self.assertNotIn("error", payload)  # None → omitted
+
+
+class HumanLogFormatTests(unittest.TestCase):
+    def setUp(self) -> None:
+        _reset_for_testing()
+        get_settings.cache_clear()
+
+    def tearDown(self) -> None:
+        # Strip any sentinel handlers we installed so the root logger is clean.
+        root = logging.getLogger()
+        for h in list(root.handlers):
+            if getattr(h, "_genai_labs_handler", False):
+                root.removeHandler(h)
+        _reset_for_testing()
+        get_settings.cache_clear()
+
+    def test_human_log_format_produces_plain_text(self) -> None:
+        settings = _build_test_settings(log_format="human")
+        with patch("src.observability.get_settings", return_value=settings):
+            configure_observability(
+                metric_exporter=MagicMock(),
+                span_exporter=MagicMock(),
+            )
+
+        # Capture output from the installed sentinel handler.
+        root = logging.getLogger()
+        sentinel = next(h for h in root.handlers if getattr(h, "_genai_labs_handler", False))
+        buf = io.StringIO()
+        assert isinstance(sentinel, logging.StreamHandler)
+        sentinel.stream = buf  # type: ignore[assignment]
+
+        logger = logging.getLogger("test.human")
+        logger.info("hello")
+
+        line = buf.getvalue().strip()
+        self.assertRegex(
+            line,
+            r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3} \[INFO\] test\.human: hello$",
+        )
+        # Confirm it is NOT JSON (the json branch would produce '{"ts": ...}').
+        self.assertFalse(line.startswith("{"))
+        # Extra belt-and-braces check via re.match on the exact shape.
+        self.assertIsNotNone(
+            re.match(
+                r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3} \[INFO\] test\.human: hello$",
+                line,
+            )
+        )
+
+
+class ExporterBranchTests(unittest.TestCase):
+    def test_build_metric_exporter_returns_otlp_when_endpoint_set(self) -> None:
+        exporter = _build_metric_exporter("http://localhost:4318/v1/metrics")
+        self.assertIsInstance(exporter, OTLPMetricExporter)
+
+    def test_build_span_exporter_returns_otlp_when_endpoint_set(self) -> None:
+        exporter = _build_span_exporter("http://localhost:4318/v1/traces")
+        self.assertIsInstance(exporter, OTLPSpanExporter)
+
+
+class HandlerCleanupIdempotenceTests(unittest.TestCase):
+    def setUp(self) -> None:
+        _reset_for_testing()
+        get_settings.cache_clear()
+        # Wipe any leftover sentinels from prior tests.
+        root = logging.getLogger()
+        for h in list(root.handlers):
+            if getattr(h, "_genai_labs_handler", False):
+                root.removeHandler(h)
+
+    def tearDown(self) -> None:
+        root = logging.getLogger()
+        for h in list(root.handlers):
+            if getattr(h, "_genai_labs_handler", False):
+                root.removeHandler(h)
+        _reset_for_testing()
+        get_settings.cache_clear()
+
+    def test_double_configure_installs_exactly_one_handler(self) -> None:
+        settings = _build_test_settings()
+        with patch("src.observability.get_settings", return_value=settings):
+            configure_observability(
+                metric_exporter=MagicMock(),
+                span_exporter=MagicMock(),
+            )
+            # Reset sentinel to force the second call to rerun the install path
+            # — this exercises the "remove old handler, add new handler" loop.
+            observability._CONFIGURED = False
+            configure_observability(
+                metric_exporter=MagicMock(),
+                span_exporter=MagicMock(),
+            )
+
+        root = logging.getLogger()
+        sentinels = [h for h in root.handlers if getattr(h, "_genai_labs_handler", False)]
+        self.assertEqual(
+            len(sentinels),
+            1,
+            f"handler cleanup must dedupe: found {len(sentinels)} sentinels",
+        )
+
+
+class ExporterNoneModeTests(unittest.TestCase):
+    def setUp(self) -> None:
+        _reset_for_testing()
+        get_settings.cache_clear()
+
+    def tearDown(self) -> None:
+        root = logging.getLogger()
+        for h in list(root.handlers):
+            if getattr(h, "_genai_labs_handler", False):
+                root.removeHandler(h)
+        _reset_for_testing()
+        get_settings.cache_clear()
+
+    def test_metrics_none_instruments_still_usable(self) -> None:
+        settings = _build_test_settings(metrics_exporter="none")
+        with patch("src.observability.get_settings", return_value=settings):
+            configure_observability(span_exporter=MagicMock())
+
+        # Instruments are registered (non-None) even without a reader.
+        self.assertIsNotNone(observability.pipeline_requests_total)
+        # .add must not raise — no reader is attached but the instrument exists.
+        assert observability.pipeline_requests_total is not None
+        observability.pipeline_requests_total.add(1, {"status": "success"})
+
+    def test_traces_none_tracer_is_noop(self) -> None:
+        settings = _build_test_settings(traces_exporter="none")
+        with patch("src.observability.get_settings", return_value=settings):
+            configure_observability(metric_exporter=MagicMock())
+
+        tracer = get_tracer()
+        # start_as_current_span must return a working context manager even
+        # when no span processor is attached (spans just don't get exported).
+        with tracer.start_as_current_span("foo") as span:
+            self.assertIsNotNone(span)
+
+    def test_default_console_exporter_preserved(self) -> None:
+        # No env overrides → default "console" exporter path is taken.
+        settings = _build_test_settings()
+        self.assertEqual(settings.metrics_exporter, "console")
+        self.assertEqual(settings.traces_exporter, "console")
+
+        with patch("src.observability.get_settings", return_value=settings):
+            # No injected exporters — real Console exporters must be built.
+            configure_observability()
+        # Instruments still registered on the configured meter provider.
+        self.assertIsNotNone(observability.pipeline_requests_total)
 
 
 if __name__ == "__main__":

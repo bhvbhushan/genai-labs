@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import statistics
 import sys
 from pathlib import Path
@@ -10,9 +11,18 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.pipeline import AnalyticsPipeline
-from scripts.gaming_csv_to_db import csv_to_sqlite
-from scripts.gaming_csv_to_db import DEFAULT_CSV_PATH, DEFAULT_DB_PATH, DEFAULT_TABLE_NAME
+# benchmark runs quiet — no metric/trace console spew. Override via env to test.
+# Must be set BEFORE importing src.pipeline so observability sees the values.
+os.environ.setdefault("OTEL_METRICS_EXPORTER", "none")
+os.environ.setdefault("OTEL_TRACES_EXPORTER", "none")
+
+from scripts.gaming_csv_to_db import (  # noqa: E402
+    DEFAULT_CSV_PATH,
+    DEFAULT_DB_PATH,
+    DEFAULT_TABLE_NAME,
+    csv_to_sqlite,
+)
+from src.pipeline import AnalyticsPipeline  # noqa: E402
 
 
 def _ensure_gaming_db() -> Path:
@@ -50,7 +60,7 @@ def main() -> None:
         for prompt in prompts:
             result = pipeline.run(prompt)
             totals.append(result.timings["total_ms"])
-            success += int(result["status"] == "success")
+            success += int(result.status == "success")
             count += 1
 
     summary = {

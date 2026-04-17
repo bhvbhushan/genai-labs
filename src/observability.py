@@ -2,7 +2,9 @@
 
 Single entry point: ``configure_observability()``. Idempotent under a lock so
 startup paths and tests can call it safely. Exporters default to Console
-(stderr); switch to OTLP HTTP when ``settings.otlp_endpoint`` is set.
+(stderr); switch to OTLP HTTP when ``settings.otlp_endpoint`` is set. Set
+``OTEL_METRICS_EXPORTER=none`` / ``OTEL_TRACES_EXPORTER=none`` to register
+instruments without attaching any reader / processor (zero stderr noise).
 
 Public surface:
     configure_observability(...)    -> None
@@ -161,13 +163,38 @@ def _install_log_handler(level: str, log_format: str) -> None:
     root.addHandler(handler)
 
 
-def _build_metric_exporter(otlp_endpoint: str | None) -> MetricExporter:
+def _build_metric_exporter(
+    otlp_endpoint: str | None,
+    exporter_name: str = "console",
+) -> MetricExporter:
+    """Pick a metric exporter. ``exporter_name="otlp"`` forces OTLP (requires
+    ``otlp_endpoint``; falls back to Console with a WARN log if unset). Any
+    other value uses OTLP if ``otlp_endpoint`` is set, else Console.
+    """
+    if exporter_name == "otlp":
+        if otlp_endpoint:
+            return OTLPMetricExporter(endpoint=otlp_endpoint)
+        logging.getLogger(__name__).warning(
+            "OTEL_METRICS_EXPORTER=otlp but no OTLP endpoint set; falling back to Console."
+        )
+        return ConsoleMetricExporter(out=sys.stderr)
     if otlp_endpoint:
         return OTLPMetricExporter(endpoint=otlp_endpoint)
     return ConsoleMetricExporter(out=sys.stderr)
 
 
-def _build_span_exporter(otlp_endpoint: str | None) -> SpanExporter:
+def _build_span_exporter(
+    otlp_endpoint: str | None,
+    exporter_name: str = "console",
+) -> SpanExporter:
+    """Pick a span exporter. See ``_build_metric_exporter`` for semantics."""
+    if exporter_name == "otlp":
+        if otlp_endpoint:
+            return OTLPSpanExporter(endpoint=otlp_endpoint)
+        logging.getLogger(__name__).warning(
+            "OTEL_TRACES_EXPORTER=otlp but no OTLP endpoint set; falling back to Console."
+        )
+        return ConsoleSpanExporter(out=sys.stderr)
     if otlp_endpoint:
         return OTLPSpanExporter(endpoint=otlp_endpoint)
     return ConsoleSpanExporter(out=sys.stderr)
@@ -236,15 +263,25 @@ def configure_observability(
         settings = get_settings()
         _install_log_handler(settings.log_level, settings.log_format)
 
-        mexp = metric_exporter or _build_metric_exporter(settings.otlp_endpoint)
-        reader = PeriodicExportingMetricReader(mexp)
-        meter_provider = MeterProvider(metric_readers=[reader])
+        # Metrics: "none" → instruments still register (no reader), zero export.
+        if metric_exporter is None and settings.metrics_exporter == "none":
+            meter_provider = MeterProvider(metric_readers=[])
+        else:
+            mexp = metric_exporter or _build_metric_exporter(
+                settings.otlp_endpoint, settings.metrics_exporter
+            )
+            reader = PeriodicExportingMetricReader(mexp)
+            meter_provider = MeterProvider(metric_readers=[reader])
         metrics.set_meter_provider(meter_provider)
         _register_instruments(meter_provider)
 
-        sexp = span_exporter or _build_span_exporter(settings.otlp_endpoint)
+        # Traces: "none" → no span processor attached; spans are no-ops.
         tracer_provider = TracerProvider()
-        tracer_provider.add_span_processor(BatchSpanProcessor(sexp))
+        if span_exporter is not None or settings.traces_exporter != "none":
+            sexp = span_exporter or _build_span_exporter(
+                settings.otlp_endpoint, settings.traces_exporter
+            )
+            tracer_provider.add_span_processor(BatchSpanProcessor(sexp))
         trace.set_tracer_provider(tracer_provider)
 
         _CONFIGURED = True

@@ -130,6 +130,26 @@ class SettingsTests(unittest.TestCase):
         ):
             Settings(_env_file=None)  # type: ignore[call-arg]
 
+    def test_exporter_defaults_are_console(self) -> None:
+        env = {"OPENROUTER_API_KEY": "sk-test"}
+        with patch.dict(os.environ, env, clear=True):
+            settings = Settings(_env_file=None)  # type: ignore[call-arg]
+
+        self.assertEqual(settings.metrics_exporter, "console")
+        self.assertEqual(settings.traces_exporter, "console")
+
+    def test_exporter_env_vars_lowercased(self) -> None:
+        env = {
+            "OPENROUTER_API_KEY": "sk-test",
+            "OTEL_METRICS_EXPORTER": "NONE",
+            "OTEL_TRACES_EXPORTER": "OtLp",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            settings = Settings(_env_file=None)  # type: ignore[call-arg]
+
+        self.assertEqual(settings.metrics_exporter, "none")
+        self.assertEqual(settings.traces_exporter, "otlp")
+
     def test_settings_frozen(self) -> None:
         env = {"OPENROUTER_API_KEY": "sk-test"}
         with patch.dict(os.environ, env, clear=True):
