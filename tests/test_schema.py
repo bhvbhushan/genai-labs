@@ -5,6 +5,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from collections.abc import Sequence
 from pathlib import Path
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
@@ -14,7 +15,11 @@ if str(BACKEND_ROOT) not in sys.path:
 from src.schema import ColumnInfo, SchemaCatalog  # noqa: E402
 
 
-def _seed(db_path: Path, ddl: str, inserts: list[tuple[str, list[tuple[object, ...]]]]) -> None:
+def _seed(
+    db_path: Path,
+    ddl: str,
+    inserts: Sequence[tuple[str, Sequence[tuple[object, ...]]]],
+) -> None:
     """Create a table via ``ddl`` and insert rows. ``inserts`` is a list of
     (parameterized SQL, list of row-tuples)."""
     conn = sqlite3.connect(db_path)
@@ -42,8 +47,7 @@ class SchemaCatalogTests(unittest.TestCase):
         for col in catalog.columns:
             if col.name == name:
                 return col
-        self.fail(f"Column {name!r} not found in catalog")
-        raise AssertionError("unreachable")  # for type checker
+        raise AssertionError(f"Column {name!r} not found in catalog")
 
     # 1. Happy path — all three kinds.
     def test_happy_path_three_kinds(self) -> None:
