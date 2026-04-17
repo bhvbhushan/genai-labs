@@ -221,3 +221,6 @@ CLAUDE.md
 
 # macOS
 .DS_Store
+
+# OTel exporter output
+.observability/

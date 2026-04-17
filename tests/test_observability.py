@@ -34,6 +34,7 @@ from src.observability import (  # noqa: E402
     get_logger,
     get_tracer,
     log_event,
+    shutdown_observability,
 )
 
 
@@ -448,6 +449,62 @@ class ExporterNoneModeTests(unittest.TestCase):
             configure_observability()
         # Instruments still registered on the configured meter provider.
         self.assertIsNotNone(observability.pipeline_requests_total)
+
+
+class FileExporterDefaultTests(unittest.TestCase):
+    def setUp(self) -> None:
+        _reset_for_testing()
+        get_settings.cache_clear()
+
+    def tearDown(self) -> None:
+        root = logging.getLogger()
+        for h in list(root.handlers):
+            if getattr(h, "_genai_labs_handler", False):
+                root.removeHandler(h)
+        _reset_for_testing()
+        get_settings.cache_clear()
+
+    def test_console_default_writes_to_file(self) -> None:
+        """Default (console) exporter writes to a stream opened by
+        ``_open_observability_file``; we patch that to a StringIO and assert
+        metric export lands in it after a ``shutdown_observability()`` flush.
+        """
+        fake_metrics = io.StringIO()
+        fake_traces = io.StringIO()
+
+        def _fake_open(kind: str) -> object:
+            return fake_metrics if kind == "metrics" else fake_traces
+
+        settings = _build_test_settings()
+        with (
+            patch("src.observability.get_settings", return_value=settings),
+            patch("src.observability._open_observability_file", side_effect=_fake_open),
+        ):
+            configure_observability()
+            assert observability.pipeline_requests_total is not None
+            observability.pipeline_requests_total.add(1, {"status": "success"})
+            shutdown_observability()
+
+        # Force flush should push at least one metric export to the file.
+        self.assertGreater(
+            len(fake_metrics.getvalue()),
+            0,
+            "metrics exporter should have written at least one record",
+        )
+
+
+class ShutdownSafetyTests(unittest.TestCase):
+    def setUp(self) -> None:
+        _reset_for_testing()
+        get_settings.cache_clear()
+
+    def tearDown(self) -> None:
+        _reset_for_testing()
+        get_settings.cache_clear()
+
+    def test_shutdown_observability_is_safe_when_not_configured(self) -> None:
+        # Must not raise when called before configure_observability().
+        shutdown_observability()
 
 
 if __name__ == "__main__":

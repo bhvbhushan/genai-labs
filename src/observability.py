@@ -1,13 +1,15 @@
 """Production observability: structured JSON logging, OTel metrics, OTel tracing.
 
 Single entry point: ``configure_observability()``. Idempotent under a lock so
-startup paths and tests can call it safely. Exporters default to Console
-(stderr); switch to OTLP HTTP when ``settings.otlp_endpoint`` is set. Set
+startup paths and tests can call it safely. Exporters default to file-based
+Console output under ``.observability/{metrics,traces}.jsonl``; switch to
+OTLP HTTP when ``settings.otlp_endpoint`` is set. Set
 ``OTEL_METRICS_EXPORTER=none`` / ``OTEL_TRACES_EXPORTER=none`` to register
-instruments without attaching any reader / processor (zero stderr noise).
+instruments without attaching any reader / processor (opt-out for tests).
 
 Public surface:
     configure_observability(...)    -> None
+    shutdown_observability()        -> None  (flush exporters at process end)
     get_logger(name)                -> logging.Logger
     get_tracer()                    -> trace.Tracer
     Timer(span_name=..., **attrs)   -> context manager (plain timer or span)
@@ -18,14 +20,17 @@ Public surface:
                                        configure_observability())
 """
 
+import contextlib
 import json
 import logging
+import os
 import sys
 import threading
 import time
 from datetime import UTC, datetime
+from pathlib import Path
 from types import TracebackType
-from typing import Any
+from typing import IO, Any
 
 from opentelemetry import metrics, trace
 from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
@@ -48,6 +53,13 @@ from opentelemetry.trace import StatusCode
 from opentelemetry.trace.status import Status
 
 from src.config import get_settings
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_OBSERVABILITY_DIR_NAME = ".observability"
+# Export interval tuned so a ~30s benchmark produces at least one export flush.
+_METRIC_EXPORT_INTERVAL_MS = 5000
+# Max wait for a best-effort force-flush at process shutdown.
+_FORCE_FLUSH_TIMEOUT_MS = 5000
 
 _TRACER_NAME = "genai_labs.pipeline"
 _METER_NAME = "genai_labs.pipeline"
@@ -107,6 +119,12 @@ answer_hallucinations_total: Counter | None = None
 
 _CONFIGURED: bool = False
 _LOCK = threading.Lock()
+# References kept so shutdown_observability() can force-flush the exact
+# SDK-backed providers we installed — ``metrics.get_meter_provider()`` only
+# returns the first provider ever set (OTel's global singleton policy), so
+# under test or re-init the API-level lookup will point at a stale provider.
+_METER_PROVIDER: MeterProvider | None = None
+_TRACER_PROVIDER: TracerProvider | None = None
 
 
 class JsonFormatter(logging.Formatter):
@@ -167,13 +185,38 @@ def _install_log_handler(level: str, log_format: str) -> None:
     root.addHandler(handler)
 
 
+def _open_observability_file(kind: str) -> IO[Any]:
+    """Open ``<repo_root>/.observability/<kind>.jsonl`` in append-text mode.
+
+    ``kind`` is ``"metrics"`` or ``"traces"``. The parent directory is
+    created on demand. The file object is returned to the caller and left
+    open for the process lifetime — the OS flushes and closes it at exit.
+    """
+    out_dir = _REPO_ROOT / _OBSERVABILITY_DIR_NAME
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / f"{kind}.jsonl"
+    return path.open("a", encoding="utf-8")
+
+
+def _console_stream(default: IO[Any]) -> IO[Any]:
+    """Resolve the Console exporter stream.
+
+    Default is the caller-provided file stream. ``PIPELINE_OTEL_EXPORTER_STREAM=stderr``
+    swaps in ``sys.stderr`` for surgical debugging.
+    """
+    if os.environ.get("PIPELINE_OTEL_EXPORTER_STREAM", "").lower() == "stderr":
+        return sys.stderr
+    return default
+
+
 def _build_metric_exporter(
     otlp_endpoint: str | None,
     exporter_name: str = "console",
 ) -> MetricExporter:
     """Pick a metric exporter. ``exporter_name="otlp"`` forces OTLP (requires
     ``otlp_endpoint``; falls back to Console with a WARN log if unset). Any
-    other value uses OTLP if ``otlp_endpoint`` is set, else Console.
+    other value uses OTLP if ``otlp_endpoint`` is set, else Console — where
+    Console writes to ``.observability/metrics.jsonl`` by default.
     """
     if exporter_name == "otlp":
         if otlp_endpoint:
@@ -181,10 +224,10 @@ def _build_metric_exporter(
         logging.getLogger(__name__).warning(
             "OTEL_METRICS_EXPORTER=otlp but no OTLP endpoint set; falling back to Console."
         )
-        return ConsoleMetricExporter(out=sys.stderr)
+        return ConsoleMetricExporter(out=_console_stream(_open_observability_file("metrics")))
     if otlp_endpoint:
         return OTLPMetricExporter(endpoint=otlp_endpoint)
-    return ConsoleMetricExporter(out=sys.stderr)
+    return ConsoleMetricExporter(out=_console_stream(_open_observability_file("metrics")))
 
 
 def _build_span_exporter(
@@ -198,10 +241,10 @@ def _build_span_exporter(
         logging.getLogger(__name__).warning(
             "OTEL_TRACES_EXPORTER=otlp but no OTLP endpoint set; falling back to Console."
         )
-        return ConsoleSpanExporter(out=sys.stderr)
+        return ConsoleSpanExporter(out=_console_stream(_open_observability_file("traces")))
     if otlp_endpoint:
         return OTLPSpanExporter(endpoint=otlp_endpoint)
-    return ConsoleSpanExporter(out=sys.stderr)
+    return ConsoleSpanExporter(out=_console_stream(_open_observability_file("traces")))
 
 
 def _register_instruments(meter_provider: APIMeterProvider) -> None:
@@ -281,7 +324,7 @@ def configure_observability(
     Optional ``metric_exporter`` / ``span_exporter`` arguments are injection
     points for tests; in production they are built from ``get_settings()``.
     """
-    global _CONFIGURED
+    global _CONFIGURED, _METER_PROVIDER, _TRACER_PROVIDER
     with _LOCK:
         if _CONFIGURED:
             return
@@ -296,10 +339,14 @@ def configure_observability(
             mexp = metric_exporter or _build_metric_exporter(
                 settings.otlp_endpoint, settings.metrics_exporter
             )
-            reader = PeriodicExportingMetricReader(mexp)
+            reader = PeriodicExportingMetricReader(
+                mexp,
+                export_interval_millis=_METRIC_EXPORT_INTERVAL_MS,
+            )
             meter_provider = MeterProvider(metric_readers=[reader])
         metrics.set_meter_provider(meter_provider)
         _register_instruments(meter_provider)
+        _METER_PROVIDER = meter_provider
 
         # Traces: "none" → no span processor attached; spans are no-ops.
         tracer_provider = TracerProvider()
@@ -309,19 +356,23 @@ def configure_observability(
             )
             tracer_provider.add_span_processor(BatchSpanProcessor(sexp))
         trace.set_tracer_provider(tracer_provider)
+        _TRACER_PROVIDER = tracer_provider
 
         _CONFIGURED = True
 
 
 def _reset_for_testing() -> None:
     """Clear the idempotence sentinel and instrument refs. Tests only."""
-    global _CONFIGURED, pipeline_requests_total, stage_duration_ms
+    global _CONFIGURED, _METER_PROVIDER, _TRACER_PROVIDER
+    global pipeline_requests_total, stage_duration_ms
     global llm_tokens_total, llm_calls_total, llm_short_circuit_total
     global llm_json_fallback_total, llm_usage_missing_total
     global response_cache_hits_total, response_cache_misses_total
     global result_validation_warnings_total, answer_hallucinations_total
     with _LOCK:
         _CONFIGURED = False
+        _METER_PROVIDER = None
+        _TRACER_PROVIDER = None
         pipeline_requests_total = None
         stage_duration_ms = None
         llm_tokens_total = None
@@ -333,6 +384,29 @@ def _reset_for_testing() -> None:
         response_cache_misses_total = None
         result_validation_warnings_total = None
         answer_hallucinations_total = None
+
+
+def shutdown_observability() -> None:
+    """Flush OTel exporters. Safe to call before ``configure_observability``
+    and safe to call multiple times. Never raises — shutdown is best-effort.
+
+    Callers should invoke at process end (e.g. at the tail of a benchmark
+    ``main()``) so a short run still exports its final metrics window.
+    """
+    with _LOCK:
+        if not _CONFIGURED:
+            return
+        mp = _METER_PROVIDER
+        tp = _TRACER_PROVIDER
+    # Force-flush the SDK-backed providers we installed. ``metrics.get_meter_provider()``
+    # may point at a stale singleton under re-init, so we hold direct references.
+    # Exceptions are swallowed: shutdown is best-effort and must not raise.
+    if mp is not None:
+        with contextlib.suppress(Exception):
+            mp.force_flush(timeout_millis=_FORCE_FLUSH_TIMEOUT_MS)
+    if tp is not None:
+        with contextlib.suppress(Exception):
+            tp.force_flush(timeout_millis=_FORCE_FLUSH_TIMEOUT_MS)
 
 
 def get_logger(name: str) -> logging.Logger:

@@ -2,20 +2,19 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import statistics
 import sys
 from collections import Counter
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-# benchmark runs quiet — no metric/trace console spew. Override via env to test.
-# Must be set BEFORE importing src.pipeline so observability sees the values.
-os.environ.setdefault("OTEL_METRICS_EXPORTER", "none")
-os.environ.setdefault("OTEL_TRACES_EXPORTER", "none")
+# OTel runs by default. Console exporters write to .observability/*.jsonl so
+# stdout stays a clean JSON blob. Opt-out remains available for tests via
+# OTEL_METRICS_EXPORTER=none / OTEL_TRACES_EXPORTER=none at invocation time.
 
 from scripts.gaming_csv_to_db import (  # noqa: E402
     DEFAULT_CSV_PATH,
@@ -23,7 +22,11 @@ from scripts.gaming_csv_to_db import (  # noqa: E402
     DEFAULT_TABLE_NAME,
     csv_to_sqlite,
 )
+from src.observability import shutdown_observability  # noqa: E402
 from src.pipeline import AnalyticsPipeline  # noqa: E402
+
+if TYPE_CHECKING:
+    from src.types import PipelineOutput
 
 
 def _ensure_gaming_db() -> Path:
@@ -41,16 +44,43 @@ def percentile(values: list[float], p: float) -> float:
     return sorted_vals[idx]
 
 
+def _is_cache_hit(result: PipelineOutput) -> bool:
+    """A cache hit carries a ``{"cache_hit": True}`` marker in the first
+    intermediate output of its SQL-generation stage (see
+    ``src.response_cache._rewrite_for_hit``). Detecting via the marker keeps
+    us independent of timing (which is zeroed on hits anyway).
+    """
+    gen = result.sql_generation
+    if gen is None or not gen.intermediate_outputs:
+        return False
+    first = gen.intermediate_outputs[0]
+    return bool(first.get("cache_hit"))
+
+
+def _bucket_stats(
+    totals: list[float],
+    total_tokens: list[float],
+    llm_calls: list[float],
+) -> dict[str, Any]:
+    """Aggregate latency/token/call percentiles for a single bucket of samples."""
+    return {
+        "count": len(totals),
+        "avg_ms": round(statistics.fmean(totals), 2) if totals else 0.0,
+        "p50_ms": round(percentile(totals, 50), 2),
+        "p95_ms": round(percentile(totals, 95), 2),
+        "avg_total_tokens": round(statistics.fmean(total_tokens), 2) if total_tokens else 0.0,
+        "p50_total_tokens": round(percentile(total_tokens, 50), 2),
+        "p95_total_tokens": round(percentile(total_tokens, 95), 2),
+        "avg_llm_calls": round(statistics.fmean(llm_calls), 4) if llm_calls else 0.0,
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--runs", type=int, default=3, help="Number of full prompt-set repetitions."
     )
     args = parser.parse_args()
-
-    # Benchmark stays quiet by default so stdout is a clean JSON blob.
-    os.environ.setdefault("OTEL_METRICS_EXPORTER", "none")
-    os.environ.setdefault("OTEL_TRACES_EXPORTER", "none")
 
     db_path = _ensure_gaming_db()
     root = Path(__file__).resolve().parents[1]
@@ -59,9 +89,19 @@ def main() -> None:
     pipeline = AnalyticsPipeline(db_path=db_path)
     prompts = json.loads(prompts_path.read_text(encoding="utf-8"))
 
+    # Combined samples (every request, hits + misses).
     totals: list[float] = []
     total_tokens: list[float] = []
     llm_calls: list[float] = []
+    # Cache-hit samples only.
+    hit_totals: list[float] = []
+    hit_tokens: list[float] = []
+    hit_calls: list[float] = []
+    # Cache-miss samples only.
+    miss_totals: list[float] = []
+    miss_tokens: list[float] = []
+    miss_calls: list[float] = []
+
     status_counter: Counter[str] = Counter()
     success = 0
     count = 0
@@ -69,10 +109,24 @@ def main() -> None:
     for _ in range(args.runs):
         for prompt in prompts:
             result = pipeline.run(prompt)
-            totals.append(result.timings["total_ms"])
+            ms = result.timings["total_ms"]
             stats = result.total_llm_stats or {}
-            total_tokens.append(float(stats.get("total_tokens", 0) or 0))
-            llm_calls.append(float(stats.get("llm_calls", 0) or 0))
+            tokens = float(stats.get("total_tokens", 0) or 0)
+            calls = float(stats.get("llm_calls", 0) or 0)
+
+            totals.append(ms)
+            total_tokens.append(tokens)
+            llm_calls.append(calls)
+
+            if _is_cache_hit(result):
+                hit_totals.append(ms)
+                hit_tokens.append(tokens)
+                hit_calls.append(calls)
+            else:
+                miss_totals.append(ms)
+                miss_tokens.append(tokens)
+                miss_calls.append(calls)
+
             status_counter[result.status] += 1
             success += int(result.status == "success")
             count += 1
@@ -84,20 +138,29 @@ def main() -> None:
         "hit_rate": round(cache.stats.hit_rate, 4),
     }
 
-    summary = {
+    obs_dir = root / ".observability"
+    observability_files = {
+        "metrics": str(obs_dir / "metrics.jsonl"),
+        "traces": str(obs_dir / "traces.jsonl"),
+    }
+
+    summary: dict[str, Any] = {
         "runs": args.runs,
         "samples": count,
         "success_rate": round(success / count, 4) if count else 0.0,
-        "avg_ms": round(statistics.fmean(totals), 2) if totals else 0.0,
-        "p50_ms": round(percentile(totals, 50), 2),
-        "p95_ms": round(percentile(totals, 95), 2),
-        "avg_total_tokens": round(statistics.fmean(total_tokens), 2) if total_tokens else 0.0,
-        "p50_total_tokens": round(percentile(total_tokens, 50), 2),
-        "p95_total_tokens": round(percentile(total_tokens, 95), 2),
-        "avg_llm_calls": round(statistics.fmean(llm_calls), 4) if llm_calls else 0.0,
         "status_breakdown": dict(status_counter),
         "cache_stats": cache_stats,
+        "observability_files": observability_files,
+        "combined": _bucket_stats(totals, total_tokens, llm_calls),
     }
+    if miss_totals:
+        summary["cache_misses_only"] = _bucket_stats(miss_totals, miss_tokens, miss_calls)
+    if hit_totals:
+        summary["cache_hits_only"] = _bucket_stats(hit_totals, hit_tokens, hit_calls)
+
+    # Final flush so the ~5s metric reader window is captured before exit.
+    shutdown_observability()
+
     print(json.dumps(summary, indent=2))
 
 
