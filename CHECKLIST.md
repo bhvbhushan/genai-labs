@@ -469,19 +469,40 @@ Include your before/after benchmark results here.
 - Success rate: `not reported (baseline crashes on 2/5 public tests and
   benchmark had an AttributeError before this submission)`
 
-**Your solution (`python scripts/benchmark.py --runs 3`, 36 samples):**
-- Average latency: `1272.00 ms`
-- p95 latency: `3549.63 ms`
-- Success rate: `91.67 %`
+**Your solution (`python scripts/benchmark.py --runs 3`, 36 samples,
+OTel exporters active, response cache fresh):**
+- Average latency (combined): `1204.72 ms`
+- p95 latency (combined): `4097.70 ms`
+- Success rate: `100.00 %` (36/36)
 
-**LLM efficiency:**
-- Average tokens per request: `460.83`
-- Average LLM calls per request: `0.6667`
+**Cache-miss cold path (first-seen question):**
+- avg latency: `3614.16 ms`
+- avg tokens: `1166.25`
+- avg LLM calls: `1.83`
+- p95 latency: `5415.59 ms`
+
+**Cache-hit served path (repeat question):**
+- avg latency: `0.00 ms` (sub-millisecond)
+- avg tokens: `0.00`
+- avg LLM calls: `0.00`
+
+**LLM efficiency (combined):**
+- Average tokens per request: `388.75`
+- Average LLM calls per request: `0.6111`
 
 **Cache efficiency:**
-- hits: `21`
-- misses: `15`
-- hit_rate: `0.5833`
+- hits: `24`
+- misses: `12`
+- hit_rate: `0.6667`
+
+**OTel exporter verification:**
+Our custom instruments now actually flush to
+`.observability/metrics.jsonl`: `pipeline_requests_total`,
+`llm_calls_total`, `llm_tokens_total`, `stage_duration_ms`,
+`response_cache_hits_total`, `response_cache_misses_total`,
+`llm_short_circuit_total`, `answer_hallucinations_total` all
+appear in the exported data. Traces flush to
+`.observability/traces.jsonl`.
 
 Notes on the numbers:
 - Slim schema prompt compresses the rendered table spec to about

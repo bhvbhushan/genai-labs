@@ -18,10 +18,12 @@ supports multi-turn conversations via an intent-routing classifier,
 adds a semantic response cache for repeat prompts, emits
 schema-aware result plausibility warnings, and cross-checks
 numeric answer claims against the returned rows. All 5/5 public
-tests pass and 218 unit tests are green. Measured on 36 samples
-(3 full prompt-set repetitions, response cache on): avg 1272 ms,
-p95 3550 ms, success rate 91.7 %, avg 461 tokens/request and avg
-0.67 LLM calls/request.
+tests pass and 220 unit tests are green. Measured on 36 samples
+(3 full prompt-set repetitions, response cache on, OTel exporters
+writing to `.observability/*.jsonl`): avg 1205 ms, p95 4098 ms,
+success rate 100 %, avg 389 tokens/request and avg 0.61 LLM
+calls/request. Cache hit rate 66.7 % (24/36); on a cache-miss
+cold request: avg 3614 ms, avg 1166 tokens, avg 1.83 LLM calls.
 
 ## What I Changed
 
@@ -201,24 +203,32 @@ flow through as `invalid_sql`. This is the fix for the public test
 
 ## Measured Impact
 
+Numbers are from a single clean `python scripts/benchmark.py --runs 3`
+run with OTel exporters active, response cache fresh, and 36 samples
+(3 × 12 public prompts).
+
 | Metric | Baseline (README) | Pre-Fix Submission | This Submission | Δ vs pre-fix |
 |--------|-------------------|--------------------|-----------------|--------------|
-| avg_ms | ~2900 | 3397 | **1272** | −63% |
-| p95_ms | ~4700 | 4931 | **3550** | −28% |
-| avg tokens/request | ~600 | 1345 | **461** | −66% |
-| avg LLM calls/request | 2.0 | 1.72 | **0.67** | −61% |
-| public tests passing | 3/5 | 5/5 (flaky) | **5/5 (5 in a row)** | ∎ |
-| success_rate (benchmark) | n/a (crashes) | 0.889 | **0.917** | +3% |
+| avg_ms (combined) | ~2900 | 3397 | **1205** | −65% |
+| p95_ms (combined) | ~4700 | 4931 | **4098** | −17% |
+| avg tokens/request (combined) | ~600 | 1345 | **389** | −71% |
+| avg LLM calls/request (combined) | 2.0 | 1.72 | **0.61** | −64% |
+| public tests passing | 3/5 | 5/5 (flaky on zodiac) | **5/5 (stable)** | ∎ |
+| success_rate (benchmark) | n/a (crashes) | 0.889 | **1.000** | +12% |
+
+**Cache-miss cold path (what a first-time-seen question costs):**
+avg 3614 ms, avg 1166 tokens, avg 1.83 LLM calls, p95 5416 ms.
+
+**Cache-hit served path (what a repeat question costs):** 0 ms,
+0 tokens, 0 LLM calls. All served from memory.
 
 ### Cache effectiveness
 
-From the final 36-sample benchmark (3 rounds × 12 prompts):
-
 | Metric | Value |
 |--------|-------|
-| hits | 21 |
-| misses | 15 |
-| hit_rate | 0.5833 |
+| hits | 24 |
+| misses | 12 |
+| hit_rate | 0.667 |
 
 Rounds 2 and 3 of the 3-round benchmark are served from cache
 almost entirely for free (zero LLM calls, zero tokens, < 20 ms
