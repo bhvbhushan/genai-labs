@@ -182,21 +182,23 @@ class SchemaCatalogTests(unittest.TestCase):
         self.assertEqual(prompt_a, prompt_b)
         self.assertTrue(prompt_a.startswith("Table: t"))
         self.assertIn("Columns:", prompt_a)
-        # Categorical: comma-joined values.
-        self.assertIn("- g (TEXT, categorical): Female, Male", prompt_a)
-        # Numeric: min dash max. Integer-valued floats render without .0
-        # so Likert scales and age ranges stay compact in the LLM prompt.
-        self.assertIn("- s (REAL, numeric): 0 – 10", prompt_a)  # noqa: RUF001
-        # Text: line with no colon-list trailing.
-        self.assertIn("- c (TEXT, text)\n", prompt_a + "\n")
-        self.assertNotIn("- c (TEXT, text):", prompt_a)
-        # all-null:
-        self.assertIn("- nul (TEXT, text): <all-null>", prompt_a)
+        # Categorical TEXT: slash-joined values.
+        self.assertIn("  g: TEXT, Female/Male", prompt_a)
+        # Numeric: min-max (plain ASCII dash). Integer-valued floats render
+        # without .0 so Likert scales and age ranges stay compact.
+        self.assertIn("  s: REAL, 0-10", prompt_a)
+        # Text: type only, no trailing comma or colon list.
+        self.assertIn("  c: TEXT\n", prompt_a + "\n")
+        self.assertNotIn("  c: TEXT,", prompt_a)
+        # all-null: parenthetical marker.
+        self.assertIn("  nul: TEXT (all-null)", prompt_a)
         # No trailing whitespace on any line.
         for line in prompt_a.split("\n"):
             self.assertEqual(line, line.rstrip())
         # No blank lines.
         self.assertNotIn("\n\n", prompt_a)
+        # EN-DASH removed from renderer output.
+        self.assertNotIn("\u2013", prompt_a)
 
     # 7. column_names returns a frozenset matching the tuple.
     def test_column_names_frozenset(self) -> None:
@@ -274,10 +276,75 @@ class SchemaCatalogTests(unittest.TestCase):
         self.assertFalse(payload.all_null)
 
         prompt = catalog.to_prompt()
-        self.assertIn("- payload (BLOB, text)", prompt)
+        self.assertIn("  payload: BLOB", prompt)
         self.assertNotIn("b'", prompt)
         self.assertNotIn('b"', prompt)
         self.assertNotIn("\\x", prompt)
+
+    # 13. Compressed prompt stays under an empirical 1200-char budget.
+    def test_slim_prompt_token_ceiling(self) -> None:
+        # Build a 39-column catalog that mirrors the real dataset:
+        # - 5 numeric broad-range columns
+        # - 10 contiguous-int Likert categoricals (1..10)
+        # - 10 binary (0..1) contiguous-int categoricals
+        # - 8 text categoricals with a handful of values each
+        # - 4 free-text columns
+        # - 2 all-null columns
+        cols: list[ColumnInfo] = []
+        for i in range(5):
+            cols.append(
+                ColumnInfo(
+                    name=f"num_broad_{i}",
+                    sql_type="INTEGER",
+                    kind="numeric",
+                    min_value=0.0,
+                    max_value=100.0,
+                )
+            )
+        for i in range(10):
+            cols.append(
+                ColumnInfo(
+                    name=f"likert_{i}",
+                    sql_type="INTEGER",
+                    kind="categorical",
+                    sample_values=tuple(str(k) for k in range(1, 11)),
+                )
+            )
+        for i in range(10):
+            cols.append(
+                ColumnInfo(
+                    name=f"binary_{i}",
+                    sql_type="INTEGER",
+                    kind="categorical",
+                    sample_values=("0", "1"),
+                )
+            )
+        for i in range(8):
+            cols.append(
+                ColumnInfo(
+                    name=f"text_cat_{i}",
+                    sql_type="TEXT",
+                    kind="categorical",
+                    sample_values=("Female", "Male", "Other"),
+                )
+            )
+        for i in range(4):
+            cols.append(
+                ColumnInfo(name=f"free_text_{i}", sql_type="TEXT", kind="text"),
+            )
+        for i in range(2):
+            cols.append(
+                ColumnInfo(name=f"all_null_{i}", sql_type="TEXT", kind="text", all_null=True),
+            )
+
+        catalog = SchemaCatalog(table="gaming_mental_health", columns=tuple(cols))
+        prompt = catalog.to_prompt()
+        self.assertEqual(len(cols), 39)
+        self.assertLess(
+            len(prompt),
+            1200,
+            f"slim prompt grew past the 1200-char ceiling: {len(prompt)}",
+        )
 
 
 if __name__ == "__main__":

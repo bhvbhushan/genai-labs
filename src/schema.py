@@ -220,13 +220,44 @@ def _classify_column(
     return ColumnInfo(name=col_name, sql_type=sql_type, kind="text")
 
 
+def _is_contiguous_int_run(values: tuple[str, ...]) -> bool:
+    """True when all strings parse as integers forming a gap-free run."""
+    if not values:
+        return False
+    try:
+        ints = sorted(int(v) for v in values)
+    except ValueError:
+        return False
+    return ints == list(range(ints[0], ints[-1] + 1))
+
+
 def _render_column(col: ColumnInfo) -> str:
-    """Render one column line of the schema prompt."""
-    prefix = f"  - {col.name} ({col.sql_type}, {col.kind})"
+    """Render one column line of the schema prompt.
+
+    Compact format, ~7 tokens/column:
+    - all-null:              "  name: TYPE (all-null)"
+    - numeric w/ range:      "  name: TYPE, min-max"
+    - categorical int run:   "  name: TYPE, min-max"
+    - categorical ints:      "  name: TYPE, 1,3,7"
+    - categorical text:      "  name: TYPE, Female/Male/Other"
+    - free text:             "  name: TYPE"
+    """
+    base = f"  {col.name}: {col.sql_type}"
     if col.all_null:
-        return f"{prefix}: <all-null>"
-    if col.kind == "categorical" and col.sample_values is not None:
-        return f"{prefix}: {', '.join(col.sample_values)}"
+        return f"{base} (all-null)"
     if col.kind == "numeric" and col.min_value is not None and col.max_value is not None:
-        return f"{prefix}: {_format_num(col.min_value)} – {_format_num(col.max_value)}"  # noqa: RUF001
-    return prefix
+        return f"{base}, {_format_num(col.min_value)}-{_format_num(col.max_value)}"
+    if col.kind == "categorical" and col.sample_values is not None:
+        values = col.sample_values
+        if _is_contiguous_int_run(values):
+            ints = sorted(int(v) for v in values)
+            return f"{base}, {ints[0]}-{ints[-1]}"
+        # All-int but non-contiguous: comma join for readability.
+        try:
+            ints_only = [int(v) for v in values]
+        except ValueError:
+            ints_only = None
+        if ints_only is not None:
+            return f"{base}, {', '.join(str(i) for i in ints_only)}"
+        return f"{base}, {'/'.join(values)}"
+    return base
