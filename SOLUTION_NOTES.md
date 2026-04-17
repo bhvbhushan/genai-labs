@@ -207,14 +207,34 @@ Numbers are from a single clean `python scripts/benchmark.py --runs 3`
 run with OTel exporters active, response cache fresh, and 36 samples
 (3 × 12 public prompts).
 
-| Metric | Baseline (README) | Pre-Fix Submission | This Submission | Δ vs pre-fix |
-|--------|-------------------|--------------------|-----------------|--------------|
+Three states are compared:
+
+1. **Original assessment** — the starting code provided in the
+   take-home. Broken: 3/5 public tests failed (no-op validator,
+   no schema in LLM prompt), benchmark crashed on a dataclass
+   access, `total_tokens` was hard-coded 0. Latency numbers are
+   the README's reference-hardware figures.
+2. **Initial build (my first pass, Lanes A–F)** — production
+   scaffolding in place (OTel, multi-turn, validator, pipeline
+   refactor) but efficiency regressed: full schema in prompt cost
+   ~500 tokens, no response cache, so repeat prompts paid full
+   LLM cost every time. Public tests passed 5/5 but zodiac flaked
+   ~1/5 runs.
+3. **This submission (after optimization round)** — slim schema,
+   response cache, column allowlist, result validator, answer
+   fidelity check, and the load-bearing fix to the
+   `from src.observability import <instrument>` binding bug that
+   meant our custom metrics were never reaching the exporter.
+
+| Metric | Original Assessment | My Initial Build | This Submission | Δ vs initial build |
+|--------|---------------------|------------------|-----------------|--------------------|
 | avg_ms (combined) | ~2900 | 3397 | **1205** | −65% |
 | p95_ms (combined) | ~4700 | 4931 | **4098** | −17% |
 | avg tokens/request (combined) | ~600 | 1345 | **389** | −71% |
 | avg LLM calls/request (combined) | 2.0 | 1.72 | **0.61** | −64% |
 | public tests passing | 3/5 | 5/5 (flaky on zodiac) | **5/5 (stable)** | ∎ |
 | success_rate (benchmark) | n/a (crashes) | 0.889 | **1.000** | +12% |
+| OTel custom metrics exported | none | none (silent bug) | **all 11 instruments** | ∎ |
 
 **Cache-miss cold path (what a first-time-seen question costs):**
 avg 3614 ms, avg 1166 tokens, avg 1.83 LLM calls, p95 5416 ms.
@@ -251,14 +271,22 @@ amortized per-request cost toward the rate-limited baseline.
   CHECKLIST items for result consistency and answer quality; both
   are non-fatal and observability-first.
 
-**Reading the table honestly.** The pre-fix submission accepted a
-deliberate regression: moving the schema to SYSTEM for correctness
-cost us baseline parity on raw tokens. The post-fix numbers erase
-that regression thanks to the slim-schema + response-cache work,
-while adding four new quality/observability systems and a tighter
-safety boundary. Cache hit rate degrades to zero on 100%-novel
-question streams; at that floor we still have the slim-schema
-win.
+**Reading the table honestly.** My initial build (Lanes A–F)
+accepted a deliberate regression vs the README reference numbers:
+moving the schema to SYSTEM for correctness cost us baseline
+parity on raw tokens. This submission (the optimization round)
+erases that regression — slim schema, response cache, and smaller
+prompts — while adding four new quality/observability systems and
+a tighter safety boundary. Cache hit rate degrades toward zero on
+100%-novel question streams; at that floor we still have the
+slim-schema win (cold path is ~1166 tokens vs 1345 in the
+pre-optimization build). Crucially, the `.observability/*.jsonl`
+files now actually contain our custom instrument data — the
+initial build had a latent bug where `from src.observability
+import pipeline_requests_total` bound the name to `None` at
+import time and `_register_instruments` rebinds were never
+observed by the consumer modules. Fixed by switching to module
+access (`_obs.pipeline_requests_total`).
 
 ## Tradeoffs
 
