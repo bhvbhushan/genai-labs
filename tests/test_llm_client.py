@@ -14,6 +14,7 @@ if str(BACKEND_ROOT) not in sys.path:
 from src.config import Settings, get_settings  # noqa: E402
 from src.llm_client import (  # noqa: E402
     OpenRouterLLMClient,
+    SQLGenerationResponse,
     _format_scalar,
     _is_auth_error,
     _rows_to_csv,
@@ -353,6 +354,47 @@ class HelperFunctionTests(unittest.TestCase):
         self.assertEqual(_format_scalar(5.0), "5")
         self.assertEqual(_format_scalar(3.75), "3.75")
         self.assertEqual(_format_scalar("Male"), "Male")
+
+
+class SQLGenerationResponseStripSQLTests(unittest.TestCase):
+    """strip_sql must trim trailing // and -- prose tails from LLM SQL output."""
+
+    def test_strips_trailing_double_slash_commentary_after_semicolon(self) -> None:
+        raw = (
+            "SELECT age, AVG(addiction_level) FROM users GROUP BY age LIMIT 5;"
+            " // Note: groups by exact age. If you meant age ranges, ..."
+        )
+        resp = SQLGenerationResponse(can_answer=True, sql=raw, reason=None)
+        assert resp.sql is not None
+        self.assertEqual(
+            resp.sql,
+            "SELECT age, AVG(addiction_level) FROM users GROUP BY age LIMIT 5;",
+        )
+
+    def test_passes_through_sql_without_trailing_commentary(self) -> None:
+        raw = "  SELECT count(*) FROM t LIMIT 10;  "
+        resp = SQLGenerationResponse(can_answer=True, sql=raw, reason=None)
+        self.assertEqual(resp.sql, "SELECT count(*) FROM t LIMIT 10;")
+
+    def test_strips_trailing_dash_dash_commentary_after_semicolon(self) -> None:
+        raw = "SELECT 1 FROM t LIMIT 1; -- extra notes from the model"
+        resp = SQLGenerationResponse(can_answer=True, sql=raw, reason=None)
+        self.assertEqual(resp.sql, "SELECT 1 FROM t LIMIT 1;")
+
+    def test_strips_trailing_double_slash_without_semicolon(self) -> None:
+        raw = "SELECT 1 FROM t LIMIT 1 // trailing note"
+        resp = SQLGenerationResponse(can_answer=True, sql=raw, reason=None)
+        self.assertEqual(resp.sql, "SELECT 1 FROM t LIMIT 1")
+
+    def test_preserves_string_literal_with_dashes_pre_semicolon(self) -> None:
+        # Body comments before the semicolon must NOT be clipped — only tail prose.
+        raw = "SELECT 'a--b' AS x FROM t LIMIT 1;"
+        resp = SQLGenerationResponse(can_answer=True, sql=raw, reason=None)
+        self.assertEqual(resp.sql, "SELECT 'a--b' AS x FROM t LIMIT 1;")
+
+    def test_sql_none_stays_none(self) -> None:
+        resp = SQLGenerationResponse(can_answer=False, sql=None, reason="nope")
+        self.assertIsNone(resp.sql)
 
 
 if __name__ == "__main__":

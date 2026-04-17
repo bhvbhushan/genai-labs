@@ -29,6 +29,9 @@ Output: return strictly one JSON object with this shape and no prose:
 
 - If can_answer is true: sql is a valid SQLite statement, reason is null.
 - If can_answer is false: sql is null and reason is a short explanation.
+- The `sql` field must contain ONLY the SQL statement itself — no trailing \
+comments, no explanatory prose, no `//`- or `--`-style notes. Put any \
+commentary in the `reason` field if needed.
 """
 
 

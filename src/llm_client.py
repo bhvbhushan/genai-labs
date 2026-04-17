@@ -88,10 +88,42 @@ class SQLGenerationResponse(BaseModel):
     @field_validator("sql")
     @classmethod
     def strip_sql(cls, v: str | None) -> str | None:
-        """Strip surrounding whitespace; leave statement-kind policy to the AST validator."""
+        """Strip whitespace and trailing-commentary tails.
+
+        Statement-kind policy lives in SQLValidator.
+        """
         if v is None:
             return None
-        return v.strip()
+        text = v.strip()
+        # Trim trailing C-style (//) and SQL line-comment (--) commentary.
+        # Only apply to the terminal tail of the string (after the last ';')
+        # so comments inside the SQL body are not clipped.
+        last_semi = text.rfind(";")
+        if last_semi != -1:
+            head, tail = text[: last_semi + 1], text[last_semi + 1 :]
+            # In `tail` (post-statement prose), strip any `//` or `--` plus
+            # everything after.
+            for marker in ("//", "--"):
+                idx = tail.find(marker)
+                if idx != -1:
+                    tail = tail[:idx]
+            text = (head + tail).rstrip()
+        else:
+            # No explicit terminator; be conservative — strip a single-line //
+            # tail only if it's in the last line of text.
+            lines = text.splitlines()
+            if lines:
+                last = lines[-1]
+                for marker in ("//", "--"):
+                    idx = last.find(marker)
+                    # Ensure the marker isn't inside a string literal on this
+                    # line: cheap heuristic is an even number of single-quotes
+                    # before it.
+                    if idx != -1 and last.count("'", 0, idx) % 2 == 0:
+                        lines[-1] = last[:idx].rstrip()
+                        break
+                text = "\n".join(lines).rstrip()
+        return text
 
 
 def _format_scalar(value: Any) -> str:
