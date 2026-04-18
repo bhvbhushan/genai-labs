@@ -1,0 +1,498 @@
+"""Tests for src.llm_client — OpenRouterLLMClient (transport + JSON + retry)."""
+
+import os
+import sys
+import unittest
+from pathlib import Path
+from typing import Any
+from unittest.mock import MagicMock, patch
+
+BACKEND_ROOT = Path(__file__).resolve().parents[1]
+if str(BACKEND_ROOT) not in sys.path:
+    sys.path.insert(0, str(BACKEND_ROOT))
+
+from src.config import Settings, get_settings  # noqa: E402
+from src.llm_client import (  # noqa: E402
+    OpenRouterLLMClient,
+    SQLGenerationResponse,
+    _answer_fidelity_warnings,
+    _format_scalar,
+    _is_auth_error,
+    _plausible_numbers,
+    _rows_to_csv,
+    build_default_llm_client,
+)
+from src.schema import SchemaCatalog  # noqa: E402
+
+
+def _make_schema() -> SchemaCatalog:
+    """Return a minimal SchemaCatalog usable in client construction."""
+    return SchemaCatalog(table="t", columns=())
+
+
+def _make_client(**overrides: Any) -> OpenRouterLLMClient:
+    """Build a client with a MagicMock OpenRouter instance attached.
+
+    All network I/O is intercepted by the mocked ``_client`` attribute. The
+    caller can override constructor kwargs via ``overrides``.
+    """
+    schema = overrides.pop("schema", _make_schema())
+    kwargs: dict[str, Any] = {
+        "api_key": "sk-test",
+        "model": "openai/test-model",
+        "schema": schema,
+        "retries": 0,
+        "retry_base_s": 0.01,
+    }
+    kwargs.update(overrides)
+    with patch("src.llm_client.OpenRouter") as mock_or:
+        mock_or.return_value = MagicMock()
+        return OpenRouterLLMClient(**kwargs)
+
+
+def _fake_response(
+    content: str,
+    *,
+    prompt_tokens: int | None = 10,
+    completion_tokens: int | None = 5,
+    total_tokens: int | None = 15,
+    no_usage: bool = False,
+) -> MagicMock:
+    """Build a fake SDK response with .choices[0].message.content + .usage."""
+    message = MagicMock()
+    message.content = content
+    choice = MagicMock()
+    choice.message = message
+    res = MagicMock(spec=["choices", "usage"])
+    res.choices = [choice]
+    if no_usage:
+        res.usage = None
+    else:
+        usage = MagicMock(spec=["prompt_tokens", "completion_tokens", "total_tokens"])
+        usage.prompt_tokens = prompt_tokens
+        usage.completion_tokens = completion_tokens
+        usage.total_tokens = total_tokens
+        res.usage = usage
+    return res
+
+
+class ConstructorTests(unittest.TestCase):
+    def test_system_prompt_is_byte_stable(self) -> None:
+        schema = _make_schema()
+        a = _make_client(schema=schema)
+        b = _make_client(schema=schema)
+        self.assertEqual(a._sql_system_message, b._sql_system_message)
+        self.assertEqual(a._sql_system_message["role"], "system")
+        # A second instance built with the same schema must produce the
+        # identical system message bytes so the LLM provider can cache.
+        self.assertIs(
+            a._sql_system_message["content"].__class__,
+            str,
+        )
+
+    def test_empty_api_key_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            _make_client(api_key="")
+
+    def test_model_name_property(self) -> None:
+        client = _make_client(model="openai/gpt-5-mini")
+        self.assertEqual(client.model_name, "openai/gpt-5-mini")
+
+
+class BuildDefaultTests(unittest.TestCase):
+    def setUp(self) -> None:
+        get_settings.cache_clear()
+
+    def tearDown(self) -> None:
+        get_settings.cache_clear()
+
+    def test_build_default_reads_settings(self) -> None:
+        env = {
+            "OPENROUTER_API_KEY": "sk-env",
+            "OPENROUTER_MODEL": "openai/env-model",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            settings = Settings(_env_file=None)  # type: ignore[call-arg]
+            with (
+                patch("src.llm_client.get_settings", return_value=settings),
+                patch("src.llm_client.OpenRouter") as mock_or,
+            ):
+                mock_or.return_value = MagicMock()
+                client = build_default_llm_client(_make_schema())
+        self.assertEqual(client.model_name, "openai/env-model")
+        # api_key must be propagated to the SDK constructor.
+        mock_or.assert_called_once()
+        kwargs = mock_or.call_args.kwargs
+        self.assertEqual(kwargs.get("api_key"), "sk-env")
+
+
+class GenerateSQLTests(unittest.TestCase):
+    def test_happy_path_json(self) -> None:
+        client = _make_client()
+        client._client.chat.send = MagicMock(  # type: ignore[method-assign]
+            return_value=_fake_response(
+                '{"can_answer": true, "sql": "SELECT 1", "reason": null}',
+                prompt_tokens=10,
+                completion_tokens=5,
+                total_tokens=15,
+            )
+        )
+        out = client.generate_sql("how many rows?")
+        self.assertEqual(out.sql, "SELECT 1")
+        self.assertIsNone(out.error)
+        self.assertEqual(out.llm_stats["prompt_tokens"], 10)
+        self.assertEqual(out.llm_stats["completion_tokens"], 5)
+        self.assertEqual(out.llm_stats["total_tokens"], 15)
+        self.assertEqual(out.llm_stats["llm_calls"], 1)
+        self.assertEqual(out.llm_stats["model"], "openai/test-model")
+
+    def test_can_answer_false(self) -> None:
+        client = _make_client()
+        client._client.chat.send = MagicMock(  # type: ignore[method-assign]
+            return_value=_fake_response(
+                '{"can_answer": false, "sql": null, "reason": "zodiac column missing"}',
+            )
+        )
+        out = client.generate_sql("what is my zodiac sign?")
+        self.assertIsNone(out.sql)
+        self.assertIsNone(out.error)
+        self.assertEqual(len(out.intermediate_outputs), 1)
+        self.assertEqual(
+            out.intermediate_outputs[0].get("reason"),
+            "zodiac column missing",
+        )
+        self.assertFalse(out.intermediate_outputs[0].get("can_answer"))
+
+    def test_plain_text_fallback_extracts_select(self) -> None:
+        client = _make_client()
+        raw = "Sure, here's the query: SELECT * FROM t WHERE gender = 'Male'"
+        client._client.chat.send = MagicMock(  # type: ignore[method-assign]
+            return_value=_fake_response(raw)
+        )
+        out = client.generate_sql("males?")
+        self.assertIsNotNone(out.sql)
+        assert out.sql is not None
+        self.assertTrue(out.sql.upper().startswith("SELECT"))
+        self.assertIn("gender = 'Male'", out.sql)
+
+    def test_non_select_sql_forwarded_to_validator(self) -> None:
+        # The client intentionally does NOT enforce SELECT-only at the
+        # pydantic layer — that is the SQLValidator's job. Non-SELECT SQL
+        # flows through so downstream layers can reject with a specific
+        # error code (pipeline status="invalid_sql") instead of the client
+        # swallowing it into can_answer=false/unanswerable.
+        client = _make_client()
+        client._client.chat.send = MagicMock(  # type: ignore[method-assign]
+            return_value=_fake_response(
+                '{"can_answer": true, "sql": "DROP TABLE t", "reason": null}',
+            )
+        )
+        out = client.generate_sql("drop it all")
+        self.assertEqual(out.sql, "DROP TABLE t")
+        self.assertIsNone(out.error)
+
+    def test_usage_missing_records_zeros(self) -> None:
+        client = _make_client()
+        client._client.chat.send = MagicMock(  # type: ignore[method-assign]
+            return_value=_fake_response(
+                '{"can_answer": true, "sql": "SELECT 1", "reason": null}',
+                no_usage=True,
+            )
+        )
+        out = client.generate_sql("x")
+        # With usage missing, stats should reflect zeros but the call still
+        # succeeded and the sql came through.
+        self.assertEqual(out.sql, "SELECT 1")
+        self.assertEqual(out.llm_stats["prompt_tokens"], 0)
+        self.assertEqual(out.llm_stats["completion_tokens"], 0)
+        self.assertEqual(out.llm_stats["total_tokens"], 0)
+        self.assertEqual(out.llm_stats["llm_calls"], 1)
+
+    def test_retry_succeeds_after_transient_error(self) -> None:
+        client = _make_client(retries=2, retry_base_s=0.001)
+        ok_response = _fake_response(
+            '{"can_answer": true, "sql": "SELECT 1", "reason": null}',
+        )
+        client._client.chat.send = MagicMock(  # type: ignore[method-assign]
+            side_effect=[ConnectionError("timeout"), ok_response],
+        )
+        # Pin the jitter source so the test is deterministic.
+        with patch("src.llm_client.random.uniform", return_value=1.0):
+            out = client.generate_sql("retry me")
+        self.assertEqual(out.sql, "SELECT 1")
+        self.assertIsNone(out.error)
+        # send was called twice: one failure + one success.
+        self.assertEqual(client._client.chat.send.call_count, 2)
+
+    def test_auth_error_is_not_retried(self) -> None:
+        client = _make_client(retries=3, retry_base_s=0.001)
+        client._client.chat.send = MagicMock(  # type: ignore[method-assign]
+            side_effect=Exception("Unauthorized: invalid API key"),
+        )
+        out = client.generate_sql("auth fail")
+        self.assertIsNone(out.sql)
+        self.assertIsNotNone(out.error)
+        assert out.error is not None
+        self.assertIn("Unauthorized", out.error)
+        # No retry was attempted.
+        self.assertEqual(client._client.chat.send.call_count, 1)
+
+    def test_chat_failure_returns_error_output(self) -> None:
+        client = _make_client(retries=0)
+        client._client.chat.send = MagicMock(  # type: ignore[method-assign]
+            side_effect=RuntimeError("network down"),
+        )
+        out = client.generate_sql("x")
+        self.assertIsNone(out.sql)
+        self.assertIsNotNone(out.error)
+        assert out.error is not None
+        self.assertIn("network down", out.error)
+        self.assertEqual(out.llm_stats["llm_calls"], 0)
+
+    def test_retry_exhausted_surfaces_last_error(self) -> None:
+        # 2 retries = 3 total attempts, all fail → error propagates as the
+        # last exception's string, all attempts counted.
+        client = _make_client(retries=2, retry_base_s=0.001)
+        client._client.chat.send = MagicMock(  # type: ignore[method-assign]
+            side_effect=[
+                ConnectionError("blip 1"),
+                ConnectionError("blip 2"),
+                ConnectionError("blip 3 final"),
+            ],
+        )
+        with patch("src.llm_client.random.uniform", return_value=1.0):
+            out = client.generate_sql("x")
+        self.assertIsNone(out.sql)
+        assert out.error is not None
+        self.assertIn("blip 3 final", out.error)
+        self.assertEqual(client._client.chat.send.call_count, 3)
+
+    def test_empty_content_raises_into_error_branch(self) -> None:
+        # Empty content → _finalize_chat raises RuntimeError, which bubbles
+        # up as the generate_sql error field.
+        client = _make_client()
+        client._client.chat.send = MagicMock(  # type: ignore[method-assign]
+            return_value=_fake_response(""),
+        )
+        out = client.generate_sql("empty")
+        self.assertIsNone(out.sql)
+        self.assertIsNotNone(out.error)
+
+
+class GenerateAnswerTests(unittest.TestCase):
+    def test_sql_none_returns_cannot_answer(self) -> None:
+        client = _make_client()
+        client._client.chat.send = MagicMock()  # type: ignore[method-assign]
+        out = client.generate_answer("q", None, [{"x": 1}])
+        self.assertIn("cannot answer", out.answer.lower())
+        self.assertEqual(out.llm_stats["prompt_tokens"], 0)
+        self.assertEqual(out.llm_stats["llm_calls"], 0)
+        # No LLM call made.
+        self.assertFalse(client._client.chat.send.called)
+
+    def test_empty_rows_returns_no_rows_message(self) -> None:
+        client = _make_client()
+        client._client.chat.send = MagicMock()  # type: ignore[method-assign]
+        out = client.generate_answer("q", "SELECT * FROM t", [])
+        self.assertIn("no matching rows", out.answer.lower())
+        self.assertEqual(out.llm_stats["total_tokens"], 0)
+        self.assertFalse(client._client.chat.send.called)
+
+    def test_multirow_triggers_llm_call(self) -> None:
+        client = _make_client()
+        client._client.chat.send = MagicMock(  # type: ignore[method-assign]
+            return_value=_fake_response(
+                "About 2000 males and 1000 females.",
+                prompt_tokens=50,
+                completion_tokens=20,
+                total_tokens=70,
+            )
+        )
+        rows = [{"gender": "Male", "n": 2000}, {"gender": "Female", "n": 1000}]
+        out = client.generate_answer("breakdown?", "SELECT gender, COUNT(*) FROM t", rows)
+        self.assertEqual(out.answer, "About 2000 males and 1000 females.")
+        self.assertIsNone(out.error)
+        self.assertEqual(out.llm_stats["total_tokens"], 70)
+        self.assertEqual(out.llm_stats["llm_calls"], 1)
+        self.assertTrue(client._client.chat.send.called)
+        # The user message must be CSV-formatted.
+        kwargs = client._client.chat.send.call_args.kwargs
+        user_msg = kwargs["messages"][-1]["content"]
+        self.assertIn("gender,n", user_msg)
+        self.assertIn("Male,2000", user_msg)
+
+    def test_llm_exception_populates_error_field(self) -> None:
+        client = _make_client(retries=0)
+        client._client.chat.send = MagicMock(  # type: ignore[method-assign]
+            side_effect=RuntimeError("boom"),
+        )
+        rows = [{"a": 1, "b": 2}, {"a": 3, "b": 4}]
+        out = client.generate_answer("?", "SELECT a, b FROM t", rows)
+        self.assertIn("Error generating answer", out.answer)
+        self.assertIsNotNone(out.error)
+        assert out.error is not None
+        self.assertIn("boom", out.error)
+
+    def test_rows_capped_to_max_rows_to_llm(self) -> None:
+        client = _make_client(max_rows_to_llm=2)
+        client._client.chat.send = MagicMock(  # type: ignore[method-assign]
+            return_value=_fake_response("ok"),
+        )
+        rows = [{"x": i} for i in range(10)]
+        client.generate_answer("q", "SELECT x FROM t", rows)
+        kwargs = client._client.chat.send.call_args.kwargs
+        user_msg = kwargs["messages"][-1]["content"]
+        # Header + 2 rows; row 2 (x=2) must NOT appear.
+        self.assertIn("x", user_msg)
+        self.assertIn("0", user_msg)
+        self.assertIn("1", user_msg)
+        self.assertNotIn("\n2\n", user_msg)
+
+    # ------------------------------------------------------------------
+    # Numeric fidelity check (flags hallucinated numbers in the answer)
+    # ------------------------------------------------------------------
+
+    def test_fidelity_clean_when_claim_in_rows(self) -> None:
+        client = _make_client()
+        client._client.chat.send = MagicMock(  # type: ignore[method-assign]
+            return_value=_fake_response("The answer is 2000."),
+        )
+        rows = [{"gender": "Male", "n": 2000}, {"gender": "Female", "n": 1000}]
+        out = client.generate_answer("?", "SELECT gender, n FROM t", rows)
+        self.assertEqual(out.intermediate_outputs, [])
+
+    def test_fidelity_clean_when_claim_is_column_average(self) -> None:
+        client = _make_client()
+        client._client.chat.send = MagicMock(  # type: ignore[method-assign]
+            return_value=_fake_response("The average is 5.0."),
+        )
+        rows = [{"v": 1}, {"v": 5}, {"v": 9}]  # avg = 5.0
+        out = client.generate_answer("?", "SELECT v FROM t", rows)
+        self.assertEqual(out.intermediate_outputs, [])
+
+    def test_fidelity_clean_when_claim_is_row_count(self) -> None:
+        client = _make_client()
+        client._client.chat.send = MagicMock(  # type: ignore[method-assign]
+            return_value=_fake_response("There are 3 rows."),
+        )
+        rows = [{"v": 100}, {"v": 200}, {"v": 300}]
+        out = client.generate_answer("?", "SELECT v FROM t", rows)
+        self.assertEqual(out.intermediate_outputs, [])
+
+    def test_fidelity_flags_invented_numeric_claim(self) -> None:
+        client = _make_client()
+        client._client.chat.send = MagicMock(  # type: ignore[method-assign]
+            return_value=_fake_response("The answer is 9999."),
+        )
+        rows = [{"v": 1}, {"v": 5}]
+        out = client.generate_answer("?", "SELECT v FROM t", rows)
+        self.assertEqual(len(out.intermediate_outputs), 1)
+        self.assertIn("suspicious_numeric_claims", out.intermediate_outputs[0])
+        claims = out.intermediate_outputs[0]["suspicious_numeric_claims"]
+        self.assertIn("9999.0", claims)
+
+    def test_fidelity_short_circuit_skipped(self) -> None:
+        # 1x1 scalar answers never hit the fidelity check (they never invoke
+        # the LLM). No intermediate_outputs should contain a suspicious list.
+        client = _make_client()
+        out = client.generate_answer("?", "SELECT COUNT(*) FROM t", [{"c": 42}])
+        for io_ in out.intermediate_outputs:
+            self.assertNotIn("suspicious_numeric_claims", io_)
+
+
+class AnswerFidelityHelperTests(unittest.TestCase):
+    def test_plausible_numbers_empty_rows_returns_zero(self) -> None:
+        self.assertEqual(_plausible_numbers([]), {0.0})
+
+    def test_plausible_numbers_includes_count_min_max_sum_avg(self) -> None:
+        rows = [{"v": 1}, {"v": 5}, {"v": 9}]
+        plausible = _plausible_numbers(rows)
+        self.assertIn(3.0, plausible)  # row count
+        self.assertIn(1.0, plausible)  # min
+        self.assertIn(9.0, plausible)  # max
+        self.assertIn(15.0, plausible)  # sum
+        self.assertIn(5.0, plausible)  # avg
+
+    def test_answer_fidelity_warnings_no_numbers(self) -> None:
+        self.assertEqual(
+            _answer_fidelity_warnings("no numeric content here", [{"v": 1}]),
+            [],
+        )
+
+    def test_answer_fidelity_warnings_bool_not_counted_as_numeric(self) -> None:
+        # Bool is a subclass of int but must not leak into plausible.
+        rows = [{"v": True}, {"v": False}]
+        # "3" is not among plausible (no numerics cached); expect flagged.
+        self.assertEqual(_answer_fidelity_warnings("About 3.", rows), ["3.0"])
+
+
+class HelperFunctionTests(unittest.TestCase):
+    def test_is_auth_error_markers(self) -> None:
+        self.assertTrue(_is_auth_error(Exception("HTTP 401 Unauthorized")))
+        self.assertTrue(_is_auth_error(Exception("invalid API key")))
+        self.assertFalse(_is_auth_error(Exception("Connection reset")))
+        self.assertFalse(_is_auth_error(Exception("500 internal server")))
+
+    def test_rows_to_csv_header_and_data(self) -> None:
+        rows: list[dict[str, Any]] = [{"a": 1, "b": 2}, {"a": 3, "b": 4}]
+        out = _rows_to_csv(rows)
+        lines = out.splitlines()
+        self.assertEqual(lines[0], "a,b")
+        self.assertEqual(lines[1], "1,2")
+        self.assertEqual(lines[2], "3,4")
+
+    def test_rows_to_csv_empty(self) -> None:
+        self.assertEqual(_rows_to_csv([]), "")
+
+    def test_format_scalar_variants(self) -> None:
+        self.assertEqual(_format_scalar(None), "None")
+        self.assertEqual(_format_scalar(True), "True")
+        self.assertEqual(_format_scalar(42), "42")
+        self.assertEqual(_format_scalar(5.0), "5")
+        self.assertEqual(_format_scalar(3.75), "3.75")
+        self.assertEqual(_format_scalar("Male"), "Male")
+
+
+class SQLGenerationResponseStripSQLTests(unittest.TestCase):
+    """strip_sql must trim trailing // and -- prose tails from LLM SQL output."""
+
+    def test_strips_trailing_double_slash_commentary_after_semicolon(self) -> None:
+        raw = (
+            "SELECT age, AVG(addiction_level) FROM users GROUP BY age LIMIT 5;"
+            " // Note: groups by exact age. If you meant age ranges, ..."
+        )
+        resp = SQLGenerationResponse(can_answer=True, sql=raw, reason=None)
+        assert resp.sql is not None
+        self.assertEqual(
+            resp.sql,
+            "SELECT age, AVG(addiction_level) FROM users GROUP BY age LIMIT 5;",
+        )
+
+    def test_passes_through_sql_without_trailing_commentary(self) -> None:
+        raw = "  SELECT count(*) FROM t LIMIT 10;  "
+        resp = SQLGenerationResponse(can_answer=True, sql=raw, reason=None)
+        self.assertEqual(resp.sql, "SELECT count(*) FROM t LIMIT 10;")
+
+    def test_strips_trailing_dash_dash_commentary_after_semicolon(self) -> None:
+        raw = "SELECT 1 FROM t LIMIT 1; -- extra notes from the model"
+        resp = SQLGenerationResponse(can_answer=True, sql=raw, reason=None)
+        self.assertEqual(resp.sql, "SELECT 1 FROM t LIMIT 1;")
+
+    def test_strips_trailing_double_slash_without_semicolon(self) -> None:
+        raw = "SELECT 1 FROM t LIMIT 1 // trailing note"
+        resp = SQLGenerationResponse(can_answer=True, sql=raw, reason=None)
+        self.assertEqual(resp.sql, "SELECT 1 FROM t LIMIT 1")
+
+    def test_preserves_string_literal_with_dashes_pre_semicolon(self) -> None:
+        # Body comments before the semicolon must NOT be clipped — only tail prose.
+        raw = "SELECT 'a--b' AS x FROM t LIMIT 1;"
+        resp = SQLGenerationResponse(can_answer=True, sql=raw, reason=None)
+        self.assertEqual(resp.sql, "SELECT 'a--b' AS x FROM t LIMIT 1;")
+
+    def test_sql_none_stays_none(self) -> None:
+        resp = SQLGenerationResponse(can_answer=False, sql=None, reason="nope")
+        self.assertIsNone(resp.sql)
+
+
+if __name__ == "__main__":
+    unittest.main()
