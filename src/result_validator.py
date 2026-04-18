@@ -8,6 +8,7 @@ Used to close the 'result validation' slot of the CHECKLIST —
 SQL validation is at the gate, this is at the output.
 """
 
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -16,6 +17,8 @@ from src.schema import SchemaCatalog
 WARN_ZERO_ROWS_NO_FILTER = "zero_rows_no_filter"
 WARN_NUMERIC_OUT_OF_RANGE = "numeric_out_of_range"
 WARN_UNKNOWN_CATEGORICAL_VALUE = "unknown_categorical_value"
+
+_WHERE_RE = re.compile(r"\bwhere\b", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -45,7 +48,7 @@ class ResultValidator:
         # Cheap heuristic: if 'where' doesn't appear (case-insensitive) in
         # the SQL and rows == [], flag it. Don't bother parsing the AST
         # here; we already trust the validator before us.
-        if not rows and "where" not in sql.lower():
+        if not rows and not _WHERE_RE.search(sql):
             warnings.append(
                 ResultWarning(
                     kind=WARN_ZERO_ROWS_NO_FILTER,
