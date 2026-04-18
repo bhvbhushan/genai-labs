@@ -139,6 +139,26 @@ class ResultValidatorTests(unittest.TestCase):
         )
         self.assertEqual(warnings, [])
 
+    def test_zero_rows_without_where_flags_even_if_identifier_contains_where(self) -> None:
+        # Column name 'nowhere' contains substring 'where' but is not a WHERE
+        # clause. The word-boundary regex catches this case.
+        schema = SchemaCatalog(
+            table="t",
+            columns=(
+                ColumnInfo(
+                    name="nowhere",
+                    sql_type="INTEGER",
+                    kind="numeric",
+                    min_value=0.0,
+                    max_value=10.0,
+                ),
+            ),
+        )
+        v = ResultValidator(schema)
+        warnings = v.validate([], "SELECT nowhere FROM t")
+        kinds = [w.kind for w in warnings]
+        self.assertIn(WARN_ZERO_ROWS_NO_FILTER, kinds)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -161,6 +161,20 @@ class ParseFailureTests(unittest.TestCase):
         self.assertEqual(result.intent, "NEW_QUERY")
         self.assertEqual(result.rewritten_question, "next q")
 
+    def test_unknown_intent_string_falls_back_to_new_query(self) -> None:
+        # Pydantic Literal validation rejects out-of-set intent; we expect the
+        # fallback path that returns NEW_QUERY with the original question.
+        llm = _make_llm_with_content(
+            '{"intent": "BOGUS_INTENT",'
+            ' "rewritten_question": "rewritten",'
+            ' "reuses_prior_rows": false}'
+        )
+        classifier = FollowupClassifier(llm)
+        history = [_turn("prev", sql="SELECT 1", rows=({"x": 1},), answer="one")]
+        out = classifier.classify_and_rewrite("what about males?", history)
+        self.assertEqual(out.intent, "NEW_QUERY")
+        self.assertEqual(out.rewritten_question, "what about males?")
+
 
 class RenderTests(unittest.TestCase):
     def test_render_is_byte_stable(self) -> None:

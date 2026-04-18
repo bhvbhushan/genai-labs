@@ -249,6 +249,24 @@ class GenerateSQLTests(unittest.TestCase):
         self.assertIn("network down", out.error)
         self.assertEqual(out.llm_stats["llm_calls"], 0)
 
+    def test_retry_exhausted_surfaces_last_error(self) -> None:
+        # 2 retries = 3 total attempts, all fail → error propagates as the
+        # last exception's string, all attempts counted.
+        client = _make_client(retries=2, retry_base_s=0.001)
+        client._client.chat.send = MagicMock(  # type: ignore[method-assign]
+            side_effect=[
+                ConnectionError("blip 1"),
+                ConnectionError("blip 2"),
+                ConnectionError("blip 3 final"),
+            ],
+        )
+        with patch("src.llm_client.random.uniform", return_value=1.0):
+            out = client.generate_sql("x")
+        self.assertIsNone(out.sql)
+        assert out.error is not None
+        self.assertIn("blip 3 final", out.error)
+        self.assertEqual(client._client.chat.send.call_count, 3)
+
     def test_empty_content_raises_into_error_branch(self) -> None:
         # Empty content → _finalize_chat raises RuntimeError, which bubbles
         # up as the generate_sql error field.

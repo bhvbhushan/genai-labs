@@ -201,6 +201,14 @@ class ResponseCacheTests(unittest.TestCase):
         # All 100 entries should have made it in without a crash.
         self.assertEqual(len(cache), 100)
 
+    def test_whitespace_and_case_normalize_to_same_key(self) -> None:
+        cache = ResponseCache()
+        a = "  What  is   X?  "
+        b = "WHAT IS X?"
+        dummy = _make_output(answer="x")
+        cache.put(a, dummy)
+        self.assertIsNotNone(cache.get(b), "normalization should make these equivalent")
+
     def test_put_existing_key_updates_value_and_promotes(self) -> None:
         cache = ResponseCache(max_entries=3)
         cache.put("q1", _make_output(answer="first"))

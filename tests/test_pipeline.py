@@ -261,6 +261,39 @@ class SQLiteExecutorTests(unittest.TestCase):
         self.assertEqual(out.row_count, 10)
 
 
+class PipelineInitTests(unittest.TestCase):
+    def test_init_fails_cleanly_on_missing_table(self) -> None:
+        # DB file exists but does not contain the default table name.
+        import os as _os
+        import sqlite3 as _sqlite3
+        import tempfile as _tempfile
+
+        from src.config import Settings
+        from src.pipeline import AnalyticsPipeline
+
+        fd, path = _tempfile.mkstemp(suffix=".sqlite")
+        _os.close(fd)
+        db_path = Path(path)
+        try:
+            conn = _sqlite3.connect(db_path)
+            try:
+                conn.execute("CREATE TABLE other (x INTEGER)")
+                conn.commit()
+            finally:
+                conn.close()
+
+            settings = Settings(
+                _env_file=None,  # type: ignore[call-arg]
+                openrouter_api_key="sk-test",
+                db_path=db_path,
+            )
+            with self.assertRaises(ValueError) as ctx:
+                AnalyticsPipeline(settings=settings)
+            self.assertIn(settings.table_name, str(ctx.exception))
+        finally:
+            db_path.unlink(missing_ok=True)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # AnalyticsPipeline orchestration — mocked components, no I/O
 # ─────────────────────────────────────────────────────────────────────────────
