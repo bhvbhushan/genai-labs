@@ -94,6 +94,12 @@ ignore_missing_imports = true
 module = "tests.*"
 disallow_untyped_defs = false
 
+# Baseline CSV loader: provided by the assessment, not part of our submission
+# surface. Keep it runnable but don't gate CI on its type annotations.
+[[tool.mypy.overrides]]
+module = "scripts.gaming_csv_to_db"
+ignore_errors = true
+
 # ────────────────────────────────────────────────────────────────────────────
 # Pyright — IDE/LSP type checker (VS Code default)
 # Points at .venv so the editor resolves installed packages.

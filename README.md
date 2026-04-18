@@ -107,6 +107,19 @@ This prints baseline-style latency stats (`avg`, `p50`, `p95`) and success rate.
 
 **Reference metrics** (baseline on reference hardware): avg ~2900ms, p50 ~2500ms, p95 ~4700ms, ~600 tokens/request. 
 
+## Multi-Turn Evaluation
+
+Exercises the conversation-aware pipeline through four scripted scenarios that cover all three follow-up intents (`NEW_QUERY`, `FOLLOWUP_NEW_SQL`, `FOLLOWUP_REINTERPRET`) plus edge cases (unrelated follow-up, empty-row reinterpret auto-downgrade).
+
+```bash
+python3 scripts/multi_turn_eval.py          # 1 run of every scenario
+python3 scripts/multi_turn_eval.py --runs 2 # repeat every scenario twice
+```
+
+Output is a single JSON blob on stdout: per-scenario turn records (question, classified intent, SQL, status, ms, tokens, LLM calls) plus an `intent_breakdown` counter and rollup averages. OTel metrics + traces for these runs land in `.observability/metrics.jsonl` and `.observability/traces.jsonl` alongside the single-turn benchmark data.
+
+A well-behaved run shows a `FOLLOWUP_REINTERPRET` turn at `~0 ms` and `0 tokens` — that's the classifier routing a "which group had the highest" follow-up back to the prior turn's cached rows instead of re-running SQL.
+
 ## Deliverables
 1. Updated source code
 2. Added tests (if any)

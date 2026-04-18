@@ -95,7 +95,10 @@ src/
   types.py            FROZEN contract
 tests/                225 unit tests, 5 frozen public tests
 scripts/
-  benchmark.py        Reports combined + cache_hits_only + cache_misses_only
-                      buckets, status breakdown, cache stats, observability
-                      file paths.
+  benchmark.py        Single-turn benchmark: combined + cache_hits_only +
+                      cache_misses_only buckets, status breakdown, cache
+                      stats, observability file paths.
+  multi_turn_eval.py  Multi-turn eval: 4 scripted conversation scenarios
+                      covering all three follow-up intents. Per-turn
+                      records + intent_breakdown + scenario rollups.
 ```

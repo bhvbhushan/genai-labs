@@ -31,8 +31,7 @@ Instruments are consumed via module access (`_obs.X`) so runtime rebinds from `_
 
 ## Validation & Quality Assurance
 
-- [x] **SQL vali
-dation** — `src/validator.py` walks the sqlglot AST: rejects Update/Delete/Insert/Create/Drop/Alter/Pragma/Attach/Explain, multi-statement, qualified tables (`other_db.t`), unknown columns (CTE outputs and outer SELECT aliases respected), strips comments, auto-injects `LIMIT`.
+- [x] **SQL validation** — `src/validator.py` walks the sqlglot AST: rejects Update/Delete/Insert/Create/Drop/Alter/Pragma/Attach/Explain, multi-statement, qualified tables (`other_db.t`), unknown columns (CTE outputs and outer SELECT aliases respected), strips comments, auto-injects `LIMIT`.
 - [x] **Answer quality** — deterministic 1×1 scalar short-circuit + canonical "cannot answer" / "no rows" messages + `_answer_fidelity_warnings`: numbers in the answer that don't match any row cell, per-column aggregate, or the row count are logged and counted.
 - [x] **Result consistency** — `SQLGenerationResponse` pydantic schema for LLM JSON output; plain-text fallback bumps `llm_json_fallback_total`. `src/result_validator.py` emits 3 non-fatal warning kinds (`zero_rows_no_filter`, `numeric_out_of_range`, `unknown_categorical_value`).
 - [x] **Error handling** — single `_derive_status()` decision table maps (gen, val, exec) → `success` / `unanswerable` / `invalid_sql` / `error`. No stage leaks an exception past `pipeline.run`.
@@ -134,10 +133,10 @@ dation** — `src/validator.py` walks the sqlglot AST: rejects Update/Delete/Ins
 **Cache efficiency:**
 - hits: `23` · misses: `13` · hit_rate: `0.6389`
 
-**OTel export verification:** `.observability/metrics.jsonl` contains records for all 11 custom instruments after this fix round (previous build had a silent `from X import <instrument>` binding bug).
+**OTel export verification:** `.observability/metrics.jsonl` contains records for all 11 custom instruments; `.observability/traces.jsonl` contains per-stage spans with `request_id` correlation.
 
 ---
 
 **Completed by:** Bhavya Bhushan
-**Date:** 2026-04-17
-**Time spent:** ~4.5 hours (planning + initial build + optimization rounds)
+**Date:** 2026-04-18
+**Time spent:** ~6 hours (planning + review + core implementation + bonus)
