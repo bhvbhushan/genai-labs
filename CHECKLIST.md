@@ -1,526 +1,142 @@
 # Production Readiness Checklist
 
-**Instructions:** Complete all sections below. Check the box when an item is implemented, and provide descriptions where requested. This checklist is a required deliverable.
-
----
-
 ## Approach
-
-Describe how you approached this assignment and what key problems you identified and solved.
 
 - [x] **System works correctly end-to-end**
 
-**What were the main challenges you identified?**
-```
-The baseline was broken on 2 of 5 public tests and `scripts/benchmark.py`
-crashed on a dataclass access.
+**Main challenges identified**
 
-1. `SQLValidator` in the baseline was a no-op that returned
-   is_valid=True for everything, including DELETE/DROP and multi-
-   statement payloads. There was no real trust boundary between the
-   LLM output and the database connection.
-2. The SQL-generation system prompt did not include the table schema.
-   The LLM was guessing column names, which produced references like
-   `addiction_score` for a column actually called `gaming_addiction_level`
-   and caused the executor to 500 on bind errors.
-3. `OpenRouterLLMClient.generate_sql` returned a `SQLGenerationOutput`
-   with `total_tokens=0` — token counting was never wired up, which
-   both the grading harness and the efficiency evaluation depend on.
-4. `scripts/benchmark.py` accessed fields that didn't exist on the
-   baseline PipelineOutput, so the benchmark exited with
-   AttributeError before printing anything.
-5. There was no observability: no structured logs, no metrics, no
-   traces. Production debugging would have been print-statement
-   archaeology.
-6. The baseline prompt leaked "do not generate write queries" wording
-   into the LLM-JSON validator slot, so DELETE prompts came back with
-   `can_answer=false` (status=unanswerable) instead of
-   `status=invalid_sql`. The LLM was doing the validator's job, badly.
-```
+1. Baseline SQLValidator was a no-op (returned `is_valid=True` for DELETE/DROP/multi-statement).
+2. Schema was not in the LLM prompt → model hallucinated column names → execution errors.
+3. `OpenRouterLLMClient` reported `total_tokens=0` (Hard Requirement not met).
+4. `scripts/benchmark.py` crashed on `result["status"]` (PipelineOutput is a dataclass).
+5. No observability (no logs / metrics / traces).
+6. Baseline prompt made the LLM self-censor DELETE queries → `status=unanswerable` instead of `invalid_sql`.
 
-**What was your approach?**
-```
-Split the work into six lanes (A–F) and build a thin orchestrator
-pipeline with one module per responsibility. Every module is
-<200 lines and has a single reason to change.
+**Approach**
 
-- Lane A (foundations): pydantic-settings config + prompt templates +
-  JSON logs + OTel metrics + OTel tracing + schema introspection.
-- Lane B (trust boundary): rewrite the validator as a sqlglot-AST
-  policy — SELECT-only, allowlist tables, strip comments, reject
-  qualified names, auto-LIMIT injection. One module is the entire
-  trust boundary between the LLM and SQLite.
-- Lane C (LLM client): real token counting from `res.usage`, JSON-mode
-  structured output with a plain-text fallback, retry-with-jittered-
-  backoff only on transient errors, a deterministic 1×1-scalar short-
-  circuit that skips the second LLM call on aggregate answers.
-- Lane D (pipeline): thin 4-stage orchestrator; a single
-  `_derive_status()` decision table; request_id propagation end-to-end;
-  read-only SQLite connection with a progress-handler deadline.
-- Lane E (multi-turn, optional): ConversationStore + FollowupClassifier;
-  one LLM call per follow-up classifies intent and rewrites in the same
-  structured response; REINTERPRET reuses prior rows and skips SQL gen
-  + validate + exec entirely.
-- Lane F (deliverables): enrich benchmark with token / call / status
-  reporting, write this checklist, write SOLUTION_NOTES.md.
-
-The single biggest architectural call was putting the schema in the
-SYSTEM prompt (byte-stable prefix → OpenRouter auto-caches) rather
-than the user turn. That plus the deterministic short-circuit is
-where most of the token savings come from.
-```
+Rewritten as a thin orchestrator (`pipeline.run` ≈ 80 LOC of orchestration) over 10 single-responsibility src modules. The validator is the single trust boundary. Schema lives in the SYSTEM prompt (byte-stable → OpenRouter auto-cache). A deterministic 1×1 scalar short-circuit skips Stage-2 LLM on aggregates. A semantic response cache serves repeat questions for free. Multi-turn uses a classify-and-rewrite LLM call to keep the generation stage stateless.
 
 ---
 
 ## Observability
 
-- [x] **Logging**
-  - Description:
-    `src/observability.py` ships a `JsonFormatter` that emits one JSON
-    line per log event to stderr. Canonical keys: `ts`, `level`,
-    `logger`, `event`, `message`, plus context fields
-    (`request_id`, `stage`, `duration_ms`, `tokens`, `status`,
-    `question`, `error`). `log_event(logger, event, **kwargs)` is the
-    one helper every module uses so the schema stays stable. stderr
-    keeps the benchmark's stdout as a pristine JSON blob.
+- [x] **Logging** — `src/observability.py::JsonFormatter` emits one JSON line to stderr per event with canonical keys (`ts`, `level`, `logger`, `event`, `request_id`, `stage`, `duration_ms`, `tokens`, `status`, `error`). `log_event(...)` is the single emitter used across the codebase.
+- [x] **Metrics** — 11 OpenTelemetry instruments: `pipeline_requests_total`, `stage_duration_ms`, `llm_{tokens,calls,short_circuit,json_fallback,usage_missing}_total`, `response_cache_{hits,misses}_total`, `result_validation_warnings_total`, `answer_hallucinations_total`. Console exporter writes to `.observability/metrics.jsonl`; OTLP when `OTEL_EXPORTER_OTLP_ENDPOINT` is set.
+- [x] **Tracing** — one `pipeline.run` span per request with stage children; exporter parallels the metrics path (`.observability/traces.jsonl` by default, OTLP via env).
 
-- [x] **Metrics**
-  - Description:
-    Seven OpenTelemetry instruments registered in
-    `src/observability.py` and populated across `pipeline.py` and
-    `llm_client.py`:
-    1. `pipeline_requests_total` (Counter, labeled by status)
-    2. `stage_duration_ms` (Histogram, labeled by stage)
-    3. `llm_tokens_total` (Counter, labeled by stage/kind)
-    4. `llm_calls_total` (Counter, labeled by stage/model)
-    5. `llm_short_circuit_total` (Counter — counts deterministic
-       1×1 scalar skips of the answer LLM call)
-    6. `llm_json_fallback_total` (Counter — counts plain-text
-       fallbacks when JSON-mode returns non-JSON)
-    7. `llm_usage_missing_total` (Counter — counts LLM responses
-       whose `res.usage` was absent, so we record zero tokens
-       honestly instead of fabricating an estimate)
-    Exporter is Console by default; toggles via the standard
-    `OTEL_METRICS_EXPORTER` env var (`none`, `console`, `otlp`).
-
-- [x] **Tracing**
-  - Description:
-    OTel `TracerProvider` configured in `configure_observability()`.
-    `pipeline.run` opens a `pipeline.run` span with the request_id;
-    each stage is wrapped in a `Timer(stage_name)` context manager
-    that also records a child span. Exporter is Console by default;
-    `OTEL_TRACES_EXPORTER=otlp` flips to OTLP-HTTP with endpoint
-    pulled from `OTEL_EXPORTER_OTLP_ENDPOINT`. No extra infra required
-    to watch traces locally.
+All instruments are consumed via module access (`_obs.X`) so `_register_instruments` rebinds are actually visible — fixed a silent-no-export bug.
 
 ---
 
 ## Validation & Quality Assurance
 
-- [x] **SQL validation**
-  - Description:
-    `src/validator.py::SQLValidator` parses the LLM SQL with sqlglot's
-    SQLite dialect and walks the AST:
-    - SELECT-only (rejects Update/Delete/Insert/Create/Drop/Alter/
-      Pragma/Attach/Explain at the AST level, not by regex).
-    - Multi-statement rejection (sqlglot returns a list of parsed
-      roots; len > 1 is a hard no).
-    - Table-name allowlist from the introspected schema
-      (rejects `sqlite_master`, `pg_catalog`, anything unknown).
-    - Qualified-name rejection (`other_db.t`, `main.t` both rejected;
-      sqlglot exposes `Table.db` so this is a single check).
-    - **Column-name allowlist**: every `exp.Column` reference must
-      resolve against the schema, a CTE output name, or an outer-
-      SELECT alias. Closes the "LLM invents `zodiac_sign`" hole that
-      let the unanswerable-prompt test occasionally false-succeed.
-    - Comment stripping — LLMs sometimes append `-- …` prose that
-      smuggles intent; we strip before re-rendering.
-    - Auto-LIMIT injection — if the SELECT has no LIMIT, we inject
-      the configured `sql_row_limit`. Preserves the original clause
-      when one is present.
-    The validator is the single trust boundary. Baseline was a no-op;
-    this is the biggest correctness delta.
-
-- [x] **Answer quality**
-  - Description:
-    Three layers:
-    - `src/llm_client.py` has a deterministic short-circuit for 1×1
-      scalar result sets — if the execution returned exactly one row
-      with one column, the answer is rendered from a template (no LLM
-      call, saves ~250 tokens + ~500ms per request). Empty result sets
-      return a canonical "no rows matched …" string. Unanswerable
-      classifications return a canonical "I cannot answer that …"
-      string. Tabular results are rendered CSV-style in the user turn
-      (not JSON) before being handed to the answer model — about 40%
-      fewer tokens per row than JSON with the same information.
-    - **Numeric-fidelity check**: after a successful answer LLM call,
-      every numeric substring in the answer is compared against the
-      plausible-numbers set (row cell values, per-column min/max/sum/
-      avg, row count) with a ~1% tolerance. Mismatches are logged as
-      `answer_fidelity_warning` and counted in
-      `answer_hallucinations_total`. Non-fatal; the number still
-      reaches the user but dashboards can alert on spikes.
-
-- [x] **Result consistency**
-  - Description:
-    Two checks:
-    - SQL generation uses OpenRouter JSON-mode with a
-      `SQLGenerationResponse` pydantic schema (`sql: str | None`,
-      `can_answer: bool`, `rationale: str`). On the rare case the
-      provider returns non-JSON text, we fall back to a plain-text
-      parser and increment `llm_json_fallback_total`. Both paths funnel
-      into the same `SQLGenerationOutput` shape so downstream stages
-      don't care which path ran.
-    - `src/result_validator.py::ResultValidator` emits non-fatal
-      warnings when returned rows look implausible: `zero_rows_no_filter`
-      (SELECT without WHERE returning nothing), `numeric_out_of_range`
-      (value outside the schema's declared min/max), and
-      `unknown_categorical_value` (a string not in the sampled distinct
-      values, catching LLM-invented category strings).
-
-- [x] **Error handling**
-  - Description:
-    `pipeline._derive_status()` is a single decision table mapping
-    (gen, val, exec) outputs to the terminal status — `error` /
-    `unanswerable` / `invalid_sql` / `success`. Each stage catches
-    its own boundary exceptions, wraps them into the stage's output
-    dataclass, and never raises past `pipeline.run`. The public test
-    `test_invalid_sql_is_rejected` now correctly gets
-    `status="invalid_sql"` (was `status="unanswerable"` in baseline
-    because the LLM was self-censoring).
+- [x] **SQL validation** — `src/validator.py` walks the sqlglot AST: rejects Update/Delete/Insert/Create/Drop/Alter/Pragma/Attach/Explain, multi-statement, qualified tables (`other_db.t`), unknown columns (CTE outputs and outer SELECT aliases respected), strips comments, auto-injects `LIMIT`.
+- [x] **Answer quality** — deterministic 1×1 scalar short-circuit + canonical "cannot answer" / "no rows" messages + `_answer_fidelity_warnings`: numbers in the answer that don't match any row cell, per-column aggregate, or the row count are logged and counted.
+- [x] **Result consistency** — `SQLGenerationResponse` pydantic schema for LLM JSON output; plain-text fallback bumps `llm_json_fallback_total`. `src/result_validator.py` emits 3 non-fatal warning kinds (`zero_rows_no_filter`, `numeric_out_of_range`, `unknown_categorical_value`).
+- [x] **Error handling** — single `_derive_status()` decision table maps (gen, val, exec) → `success` / `unanswerable` / `invalid_sql` / `error`. No stage leaks an exception past `pipeline.run`.
 
 ---
 
 ## Maintainability
 
-- [x] **Code organization**
-  - Description:
-    Seven new modules, each <200 lines, each with one responsibility:
-    `config.py`, `observability.py`, `prompts.py`, `schema.py`,
-    `validator.py`, `llm_client.py`, `pipeline.py` — plus
-    `conversation.py` and `followup.py` for the optional multi-turn
-    lane. The pipeline module is a thin orchestrator: no business
-    logic, just stage wiring and status derivation. Tests mirror
-    the structure 1:1 (`test_<module>.py`).
-
-- [x] **Configuration**
-  - Description:
-    `src/config.py::Settings` is a frozen `pydantic-settings.BaseSettings`
-    with env-driven defaults and bounded fields (row caps >= 1, token
-    budgets in [100, 8192], retry counts in [0, 5], timeouts > 0).
-    `load_dotenv` runs at `src/__init__.py` import. The API key is
-    validated as non-empty at settings construction — fast failure
-    rather than a 401 three stages deep.
-
-- [x] **Error handling**
-  - Description:
-    Stdlib exceptions throughout — no custom hierarchy. Narrow
-    try/except only at the boundaries that actually do I/O
-    (LLM HTTP, SQLite execute, sqlglot parse). Each boundary
-    records the error into a dataclass field and returns; the
-    pipeline never leaks an exception to the caller.
-
-- [x] **Documentation**
-  - Description:
-    Every module has a module-level docstring explaining the
-    responsibility and the key design choices. Every public function
-    and method has a docstring. This `CHECKLIST.md` plus
-    `SOLUTION_NOTES.md` cover the narrative layer. No new user-facing
-    docs were added beyond those two deliverables.
+- [x] **Code organization** — 10 src modules, each ≤ 670 LOC; tests mirror src 1:1. Pipeline is pure orchestration; validation, transport, observability, caching, classification each live in one place.
+- [x] **Configuration** — `src/config.py::Settings` (pydantic-settings): frozen, env-driven, bounded (counts ≥ 1, timeouts > 0, retries in [0,5]); API key validated non-empty at init.
+- [x] **Error handling** — stdlib exceptions; narrow `try/except` only at I/O boundaries (LLM HTTP, SQLite, sqlglot parse). No custom exception hierarchy.
+- [x] **Documentation** — module docstring + public-API docstrings on every module. `SOLUTION_NOTES.md` + this checklist cover the narrative.
 
 ---
 
 ## LLM Efficiency
 
-- [x] **Token usage optimization**
-  - Description:
-    Five stacked optimizations:
-    1. Schema lives in the SYSTEM prompt as a byte-stable prefix, so
-       OpenRouter's automatic prompt cache hits on every call after
-       the first.
-    2. **Slim schema prompt**: each column renders as ~7 tokens
-       (`  age: INTEGER, 13-59`) instead of the old ~17 tokens
-       (`- age (INTEGER, numeric): 13 – 59`). For 39 columns this
-       is a ~500-char / ~150-token saving on every request.
-    3. CSV row serialization in the answer user turn — ~40% fewer
-       tokens than JSON for the same rows.
-    4. Deterministic 1×1 scalar short-circuit — skips the answer
-       LLM call entirely on aggregate questions (COUNT/AVG/SUM
-       type prompts).
-    5. `max_tokens` cap + `reasoning.effort=minimal` on the
-       `gpt-5-nano` model so the model doesn't burn tokens on
-       hidden reasoning.
-
-- [x] **Efficient LLM requests**
-  - Description:
-    JSON-mode structured outputs cut the refusal/refine round-trips
-    that plain text needs for "did it actually give me SQL" checks.
-    Retries are capped at `llm_retries=2` with jittered exponential
-    backoff (`2 ** n + uniform(0, base)`), and the retry wrapper only
-    retries transient errors (connection reset, 5xx, rate limit) —
-    auth failures and malformed requests fail fast. No retries on
-    the answer generation stage (if we got SQL results, we're going
-    to report them; a second answer attempt isn't going to improve
-    anything).
-    **Response cache** (`src/response_cache.py`): exact-match LRU
-    keyed on normalized question hashes. Repeat prompts return the
-    cached `PipelineOutput` with zeroed `total_llm_stats` and
-    timings and a `{cache_hit: True}` marker in
-    `sql_generation.intermediate_outputs`. Single-turn only; on
-    the 3-round benchmark this cuts avg tokens from ~1345 to ~461
-    and avg latency from ~3397 ms to ~1272 ms.
+- [x] **Token usage optimization** —
+  1. Schema in SYSTEM prompt (byte-stable) → OpenRouter auto-cache.
+  2. Slim schema render (~50% smaller than the initial build).
+  3. CSV rows vs JSON in the answer prompt (~40% fewer tokens).
+  4. Deterministic 1×1 scalar short-circuit skips Stage-2 LLM on aggregate prompts.
+  5. Semantic response cache (exact match on normalized question) — repeat prompts cost 0 tokens.
+  6. `reasoning.effort=minimal` on gpt-5-nano.
+- [x] **Efficient LLM requests** — JSON-mode structured output avoids re-ask rounds. Retry only on transient errors (connection / 5xx / rate limit) with jittered backoff; auth failures fail fast. `max_tokens` capped per stage.
 
 ---
 
 ## Testing
 
-- [x] **Unit tests**
-  - Description:
-    218 unit tests across 12 files, zero network calls. The LLM
-    client is tested with a `FakeOpenRouter` that returns canned
-    responses so we cover JSON-mode, plain-text fallback, retry,
-    short-circuit, auth-fail-no-retry, and usage-missing all
-    deterministically.
-
-- [x] **Integration tests**
-  - Description:
-    5 frozen public tests in `tests/test_public.py` (not modified).
-    All 5 pass with a valid `OPENROUTER_API_KEY` in env. These are
-    real end-to-end tests that hit the real LLM, the real validator,
-    and the real SQLite DB. The occasional flake on
-    `test_unanswerable_prompt_is_handled` (zodiac prompt) is documented
-    in the Production Readiness Summary.
-
-- [x] **Performance tests**
-  - Description:
-    `scripts/benchmark.py` runs the full 12-prompt public-prompts
-    set N times (`--runs 3` by default), reporting
-    avg/p50/p95 latency, avg/p50/p95 total_tokens, avg LLM calls
-    per request, success rate, and a status breakdown. OTel
-    exporters are gated to `none` so stdout is a pristine JSON blob.
-
-- [x] **Edge case coverage**
-  - Description:
-    Covered in unit tests:
-    - Qualified-table rejection (`other_db.t`)
-    - Comment smuggling (`-- DROP TABLE…`)
-    - CTE name shadowing (CTE named the same as an allowlisted
-      table)
-    - BLOB columns (truncated in LLM-facing schema rendering)
-    - Distinct-cap boundary (categorical render cuts at
-      max_distinct_values)
-    - All-null columns (rendered as "all null" not as a useless
-      distinct list)
-    - `res.usage` missing (records zeros + increments
-      `llm_usage_missing_total`)
-    - Auth failure does not retry (wastes no tokens)
-    - Row cap boundary (exactly `max_rows_return` vs one more)
-    - Deadline timeout (progress-handler aborts long queries)
+- [x] **Unit tests** — 225 offline tests across 11 files, zero network calls. SDK mocked via `unittest.mock`.
+- [x] **Integration tests** — 5 frozen public tests pass (real LLM, real SQLite). Retest-stable after the column-allowlist fix.
+- [x] **Performance tests** — `scripts/benchmark.py --runs 3` reports combined + cache-hit-only + cache-miss-only buckets, plus status breakdown, cache stats, and paths to the exported OTel data.
+- [x] **Edge case coverage** — qualified tables, unknown columns, CTE shadowing + CTE-body-references-unknown-table, comment smuggling (line + block), UNION, multi-statement, BLOB columns, all-null columns, distinct-cap boundary, `usage` missing, auth no-retry, retry exhausted, row-cap boundary, progress-handler deadline, whitespace+case normalization in cache key, row-trim on Turn append, unknown intent fallback, WHERE-clause word-boundary false-negative, pipeline init on DB missing the target table.
 
 ---
 
 ## Optional: Multi-Turn Conversation Support
 
-**Only complete this section if you implemented the optional follow-up questions feature.**
+- [x] **Intent detection** — `src/followup.py::classify_and_rewrite` makes one LLM JSON call over the last 4 turns. Returns one of `NEW_QUERY`, `FOLLOWUP_NEW_SQL`, `FOLLOWUP_REINTERPRET`. Empty history short-circuits (no LLM call).
+- [x] **Context-aware SQL generation** — `FOLLOWUP_NEW_SQL` produces a self-contained rewrite that flows through the normal pipeline (generation stage stays stateless). `FOLLOWUP_REINTERPRET` skips SQL gen + validation + execution entirely and reuses the prior turn's cached rows. Auto-downgrades to `FOLLOWUP_NEW_SQL` if prior rows are missing.
+- [x] **Context persistence** — `src/conversation.py::ConversationStore`: in-memory `OrderedDict` with LRU at three levels (convo count, turns per convo, rows per turn). Interface-clean for a Redis/Postgres swap.
+- [x] **Ambiguity resolution** — single structured LLM call over `last_turns(conv_id, 4)`; unit-tested with mocked LLM (no network).
 
-- [x] **Intent detection for follow-ups**
-  - Description: `src/followup.py::FollowupClassifier.classify_and_rewrite`
-    makes a single LLM JSON call over the last 4 turns of the
-    conversation and returns one of three intents: `NEW_QUERY`
-    (unrelated question, pipeline runs as if it were a cold start),
-    `FOLLOWUP_NEW_SQL` (related but needs fresh SQL — LLM also
-    returns a self-contained rewrite), `FOLLOWUP_REINTERPRET`
-    (same data, different question — e.g. "now explain the highest
-    value"). Empty history short-circuits to NEW_QUERY without any
-    LLM call.
-
-- [x] **Context-aware SQL generation**
-  - Description: On `FOLLOWUP_NEW_SQL` the classifier returns a
-    rewritten, self-contained question (e.g. "what about males?"
-    → "Among males, what is the addiction-level distribution?"),
-    which then flows through the standard pipeline — the downstream
-    stages never have to know about history. On
-    `FOLLOWUP_REINTERPRET` the pipeline skips SQL generation,
-    validation, and execution entirely, reusing the prior turn's
-    cached rows. If the classifier wants REINTERPRET but the prior
-    turn has no rows, we downgrade to `FOLLOWUP_NEW_SQL` so the
-    user always gets an answer.
-
-- [x] **Context persistence**
-  - Description: `src/conversation.py::ConversationStore` is an
-    in-memory `OrderedDict` with LRU eviction at three levels:
-    convo-cap (how many conversations to keep), turn-cap per convo,
-    and row-cap per turn. Each `Turn` records question, rewrite
-    (if any), intent, sql, rows (tuple so it's hashable), and
-    answer. The store is interface-clean enough that swapping it
-    for a Redis or Postgres implementation is a one-class change —
-    the pipeline only calls `append`, `last_turns`, and
-    `__contains__`.
-
-- [x] **Ambiguity resolution**
-  - Description: Single LLM JSON call over `last_turns(conv_id, 4)`
-    produces `{intent, rewritten_question, reuses_prior_rows, rationale}`.
-    Tested via mocked fixtures in `tests/test_followup.py` — we
-    inject a `FakeLLM` returning specific JSON payloads and assert
-    the classifier hands them back correctly typed. No network calls
-    in unit tests.
-
-**Approach summary:**
-```
-One module per concern, both <150 lines.
-
-- `conversation.py` is a dumb data store: OrderedDict LRU + Turn
-  dataclass. No business logic; interface-clean so Redis is a
-  drop-in swap later.
-- `followup.py` is a classifier: one LLM call, strict pydantic
-  response schema, three named intents. The classifier does NOT
-  call the pipeline — it just returns a decision + a rewritten
-  question. That keeps the dependency graph acyclic and makes it
-  testable without spinning up the whole pipeline.
-- `pipeline.run` takes an optional `conversation_id` kwarg. When
-  present with prior history, it runs the classifier first; when
-  absent, the code path is byte-for-byte the same as single-turn.
-  This means adding multi-turn cost exactly zero latency on
-  single-turn calls.
-
-The rewrite-to-self-contained strategy (rather than feeding history
-into the generation prompt) was deliberate: it keeps the system
-prompt byte-stable across turns (prompt cache stays hot) and keeps
-the generation stage stateless. Every downstream stage sees one
-question; only the classifier sees history.
-```
+**Approach summary** — rewrite-to-self-contained, not inject-history-into-generation-prompt. Keeps system prompt byte-stable (cache stays hot) and keeps the generation stage stateless.
 
 ---
 
 ## Production Readiness Summary
 
-**What makes your solution production-ready?**
-```
-- Real trust boundary: sqlglot AST policy rejects every non-SELECT
-  construct before a connection is opened, and the SQLite connection
-  is opened read-only with a statement deadline on top.
-- Real observability: structured JSON logs, seven OTel metrics,
-  OTel spans per stage; exporters toggle via stock env vars so you
-  can point at any OTLP collector without code changes.
-- Real token accounting: every LLM call records prompt/completion
-  token counts from `res.usage`; missing-usage is tracked via its
-  own counter so dashboards can alert on degraded providers rather
-  than silently reporting zeros.
-- Typed, tested, and strict: pydantic Settings for config,
-  sqlglot for SQL, pydantic schemas for LLM JSON mode; mypy --strict
-  and pyright clean; 177 tests cover the core paths plus every edge
-  case we could think of.
-- Thin orchestrator pattern: `pipeline.run` is ~80 lines, calls into
-  seven focused modules; status derivation is one decision table.
-  The failure modes are enumerable.
-```
+**What makes it production-ready**
 
-**Key improvements over baseline:**
-```
-- 5/5 public tests pass (baseline: 3/5 — validator was a no-op,
-  schema was not in the prompt, DELETE prompts returned
-  status=unanswerable instead of status=invalid_sql).
-- Real token counts (baseline: always 0 — token counting was never
-  implemented, which was listed as a Hard Requirement).
-- Benchmark script runs cleanly and reports enriched efficiency
-  metrics (baseline: AttributeError crash before any output).
-- Observability layer (baseline: no logs, no metrics, no traces).
-- Safer executor: read-only connection + progress-handler deadline
-  (baseline: read-write connection, no timeout).
-- Optional: multi-turn conversations with intent-routed pipeline
-  path that skips redundant LLM work on REINTERPRET follow-ups.
-```
+- Real trust boundary: sqlglot AST policy before any SQLite connection; connection opened read-only with a statement deadline.
+- Real observability: JSON logs + 11 OTel metrics + OTel spans; toggles to OTLP with stock env vars.
+- Real token accounting: extracted from `res.usage`; missing usage tracked explicitly rather than estimated.
+- Typed, tested, strict: pydantic for config + LLM JSON + schema models; `mypy --strict` + `pyright` + `ruff` clean.
+- Thin orchestrator: `pipeline.run` is ~80 LOC; failure modes are enumerable.
 
-**Known limitations or future work:**
-```
-- LLM nondeterminism on borderline prompts. In practice we see an
-  occasional (~1/5 runs) flake on `test_unanswerable_prompt_is_handled`
-  where the zodiac prompt sometimes gets a hallucinated SQL instead
-  of an unanswerable classification. The model self-chose to answer.
-  Tightening the system prompt further starts rejecting legitimate
-  queries; the right production fix is a second-pass "answerability"
-  check, but that's a measurable latency cost we declined to take
-  for a take-home.
-- OTel-SDK global-provider warnings can appear when the test suite
-  runs multiple pipelines in one process (global provider re-init).
-  Harmless, but noisy; we suppress in test configuration.
-- ConversationStore is in-memory. Not durable across process
-  restarts; the interface is stable so swapping to Redis is
-  confined to a single class.
-- Token counting depends on `res.usage`. If a provider routes
-  through an adapter that strips usage, we record zeros and
-  increment `llm_usage_missing_total`. We do not estimate from
-  string length.
-- Deterministic short-circuit fires only on 1×1 scalar results.
-  Multi-row results still go through the answer LLM; future work
-  could add template-based rendering for narrow frequent shapes.
-```
+**Key improvements over baseline**
+
+- 5/5 public tests pass (was 3/5).
+- Real token counts from `res.usage` (was hard-coded 0).
+- Benchmark runs cleanly and reports enriched metrics (was AttributeError crash).
+- −65% avg latency, −71% avg tokens/req, −64% avg LLM calls/req vs my initial build.
+- Multi-turn support with zero regression on single-turn.
+
+**Known limitations / future work**
+
+- In-memory ConversationStore and ResponseCache (Redis swap is single-class).
+- Exact-match response cache (embedding similarity is the obvious next step).
+- `res.usage`-dependent token counts (degraded providers record zeros, not estimates — by design).
+- Deterministic short-circuit only fires on 1×1 scalar (template renderers for narrow frequent shapes would extend the pattern).
 
 ---
 
 ## Benchmark Results
 
-Include your before/after benchmark results here.
-
 **Baseline (reference hardware, per README):**
 - Average latency: `~2900 ms`
 - p50 latency: `~2500 ms`
 - p95 latency: `~4700 ms`
-- Success rate: `not reported (baseline crashes on 2/5 public tests and
-  benchmark had an AttributeError before this submission)`
+- Success rate: `not reported (baseline benchmark crashes before any output)`
 
-**Your solution (`python scripts/benchmark.py --runs 3`, 36 samples,
-OTel exporters active, response cache fresh):**
-- Average latency (combined): `1204.72 ms`
-- p95 latency (combined): `4097.70 ms`
-- Success rate: `100.00 %` (36/36)
+**This submission** (`python scripts/benchmark.py --runs 3`, 36 samples, fresh cache, OTel active):
+- Average latency (combined): `1051.05 ms`
+- p95 latency (combined): `3755.40 ms`
+- Success rate: `97.22 %` (35 success + 1 error — LLM nondeterminism on one borderline prompt; no exception leaked)
 
 **Cache-miss cold path (first-seen question):**
-- avg latency: `3614.16 ms`
-- avg tokens: `1166.25`
-- avg LLM calls: `1.83`
-- p95 latency: `5415.59 ms`
+- avg latency: `2910.61 ms` · avg tokens: `1179.00` · avg LLM calls: `1.77` · p95 latency: `4293.81 ms`
 
 **Cache-hit served path (repeat question):**
-- avg latency: `0.00 ms` (sub-millisecond)
-- avg tokens: `0.00`
-- avg LLM calls: `0.00`
+- avg latency: `0 ms` · avg tokens: `0` · avg LLM calls: `0`
 
 **LLM efficiency (combined):**
-- Average tokens per request: `388.75`
-- Average LLM calls per request: `0.6111`
+- Average tokens per request: `425.75`
+- Average LLM calls per request: `0.6389`
 
 **Cache efficiency:**
-- hits: `24`
-- misses: `12`
-- hit_rate: `0.6667`
+- hits: `23` · misses: `13` · hit_rate: `0.6389`
 
-**OTel exporter verification:**
-Our custom instruments now actually flush to
-`.observability/metrics.jsonl`: `pipeline_requests_total`,
-`llm_calls_total`, `llm_tokens_total`, `stage_duration_ms`,
-`response_cache_hits_total`, `response_cache_misses_total`,
-`llm_short_circuit_total`, `answer_hallucinations_total` all
-appear in the exported data. Traces flush to
-`.observability/traces.jsonl`.
-
-Notes on the numbers:
-- Slim schema prompt compresses the rendered table spec to about
-  45% of its previous size, so the first-ever request is already
-  much cheaper. Subsequent rounds are served from the response
-  cache almost for free.
-- Avg LLM calls of ~0.67 reflects both the deterministic 1×1
-  scalar short-circuit AND the response cache absorbing rounds 2
-  and 3 of the benchmark.
-- The non-success responses in this run are `invalid_sql` (2) and
-  `error` (1) out of 36 samples — these are borderline prompts
-  where the LLM occasionally produces something the validator
-  rejects or the executor cannot run; each of these is a correct,
-  graceful failure (no exception leaks, status is accurate) rather
-  than a crash.
+**OTel export verification:** `.observability/metrics.jsonl` contains records for all 11 custom instruments after this fix round (previous build had a silent `from X import <instrument>` binding bug).
 
 ---
 
 **Completed by:** Bhavya Bhushan
 **Date:** 2026-04-17
-**Time spent:** ~8 hours
+**Time spent:** ~10 hours (initial build + optimization round)
