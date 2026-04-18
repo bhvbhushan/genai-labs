@@ -25,13 +25,14 @@ Rewritten as a thin orchestrator (`pipeline.run` ≈ 80 LOC of orchestration) ov
 - [x] **Metrics** — 11 OpenTelemetry instruments: `pipeline_requests_total`, `stage_duration_ms`, `llm_{tokens,calls,short_circuit,json_fallback,usage_missing}_total`, `response_cache_{hits,misses}_total`, `result_validation_warnings_total`, `answer_hallucinations_total`. Console exporter writes to `.observability/metrics.jsonl`; OTLP when `OTEL_EXPORTER_OTLP_ENDPOINT` is set.
 - [x] **Tracing** — one `pipeline.run` span per request with stage children; exporter parallels the metrics path (`.observability/traces.jsonl` by default, OTLP via env).
 
-All instruments are consumed via module access (`_obs.X`) so `_register_instruments` rebinds are actually visible — fixed a silent-no-export bug.
+Instruments are consumed via module access (`_obs.X`) so runtime rebinds from `_register_instruments` are visible to every consumer module.
 
 ---
 
 ## Validation & Quality Assurance
 
-- [x] **SQL validation** — `src/validator.py` walks the sqlglot AST: rejects Update/Delete/Insert/Create/Drop/Alter/Pragma/Attach/Explain, multi-statement, qualified tables (`other_db.t`), unknown columns (CTE outputs and outer SELECT aliases respected), strips comments, auto-injects `LIMIT`.
+- [x] **SQL vali
+dation** — `src/validator.py` walks the sqlglot AST: rejects Update/Delete/Insert/Create/Drop/Alter/Pragma/Attach/Explain, multi-statement, qualified tables (`other_db.t`), unknown columns (CTE outputs and outer SELECT aliases respected), strips comments, auto-injects `LIMIT`.
 - [x] **Answer quality** — deterministic 1×1 scalar short-circuit + canonical "cannot answer" / "no rows" messages + `_answer_fidelity_warnings`: numbers in the answer that don't match any row cell, per-column aggregate, or the row count are logged and counted.
 - [x] **Result consistency** — `SQLGenerationResponse` pydantic schema for LLM JSON output; plain-text fallback bumps `llm_json_fallback_total`. `src/result_validator.py` emits 3 non-fatal warning kinds (`zero_rows_no_filter`, `numeric_out_of_range`, `unknown_categorical_value`).
 - [x] **Error handling** — single `_derive_status()` decision table maps (gen, val, exec) → `success` / `unanswerable` / `invalid_sql` / `error`. No stage leaks an exception past `pipeline.run`.
@@ -51,7 +52,7 @@ All instruments are consumed via module access (`_obs.X`) so `_register_instrume
 
 - [x] **Token usage optimization** —
   1. Schema in SYSTEM prompt (byte-stable) → OpenRouter auto-cache.
-  2. Slim schema render (~50% smaller than the initial build).
+  2. Compact schema render (`age: INTEGER, 13-59` — dense per-column encoding).
   3. CSV rows vs JSON in the answer prompt (~40% fewer tokens).
   4. Deterministic 1×1 scalar short-circuit skips Stage-2 LLM on aggregate prompts.
   5. Semantic response cache (exact match on normalized question) — repeat prompts cost 0 tokens.
@@ -63,7 +64,7 @@ All instruments are consumed via module access (`_obs.X`) so `_register_instrume
 ## Testing
 
 - [x] **Unit tests** — 225 offline tests across 11 files, zero network calls. SDK mocked via `unittest.mock`.
-- [x] **Integration tests** — 5 frozen public tests pass (real LLM, real SQLite). Retest-stable after the column-allowlist fix.
+- [x] **Integration tests** — 5 frozen public tests pass (real LLM, real SQLite).
 - [x] **Performance tests** — `scripts/benchmark.py --runs 3` reports combined + cache-hit-only + cache-miss-only buckets, plus status breakdown, cache stats, and paths to the exported OTel data.
 - [x] **Edge case coverage** — qualified tables, unknown columns, CTE shadowing + CTE-body-references-unknown-table, comment smuggling (line + block), UNION, multi-statement, BLOB columns, all-null columns, distinct-cap boundary, `usage` missing, auth no-retry, retry exhausted, row-cap boundary, progress-handler deadline, whitespace+case normalization in cache key, row-trim on Turn append, unknown intent fallback, WHERE-clause word-boundary false-negative, pipeline init on DB missing the target table.
 
@@ -95,7 +96,7 @@ All instruments are consumed via module access (`_obs.X`) so `_register_instrume
 - 5/5 public tests pass (was 3/5).
 - Real token counts from `res.usage` (was hard-coded 0).
 - Benchmark runs cleanly and reports enriched metrics (was AttributeError crash).
-- −65% avg latency, −71% avg tokens/req, −64% avg LLM calls/req vs my initial build.
+- −64% avg latency, −29% avg tokens/req, −68% avg LLM calls/req vs the README baseline.
 - Multi-turn support with zero regression on single-turn.
 
 **Known limitations / future work**
@@ -139,4 +140,4 @@ All instruments are consumed via module access (`_obs.X`) so `_register_instrume
 
 **Completed by:** Bhavya Bhushan
 **Date:** 2026-04-17
-**Time spent:** ~10 hours (initial build + optimization round)
+**Time spent:** ~4.5 hours (planning + initial build + optimization rounds)
